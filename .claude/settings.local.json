@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Edit",
+      "Write",
+      "Read",
+      "Glob",
+      "Grep",
+      "Skill",
+      "Task",
+      "WebFetch(domain:*)",
+      "WebSearch",
+      "mcp__*"
+    ]
+  }
+}
