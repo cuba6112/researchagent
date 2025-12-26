@@ -35,8 +35,14 @@ agent1/
 │       ├── memory.json          # Research history, insights, failures
 │       └── reports/             # Generated papers and summaries
 ├── .claude/
-│   └── skills/
-│       └── SKILL.md             # Project-local gemini-genai skill
+│   ├── settings.local.json      # Tool permissions
+│   └── skills/                  # Project-local skills
+│       ├── google-adk/
+│       ├── gemini-genai/
+│       ├── uv-advanced/
+│       ├── prompt-engineering/
+│       ├── mcp-builder/
+│       └── headless-cli-agents/
 ├── pyproject.toml               # Dependencies: google-adk, playwright
 ├── main.py                      # Entry point (imports ika_agent)
 ├── CLAUDE.md                    # This file
