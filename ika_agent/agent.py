@@ -30,7 +30,7 @@ import os
 # OUTPUT DIRECTORY
 # ============================================================================
 
-OUTPUT_DIR = Path(__file__).parent / "outputs"
+OUTPUT_DIR = Path(__file__).parent.parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 MEMORY_FILE = OUTPUT_DIR / "memory.json"
 REPORTS_DIR = OUTPUT_DIR / "reports"
@@ -46,6 +46,7 @@ class Memory:
     history: List[Dict] = field(default_factory=list)
     insights: List[str] = field(default_factory=list)
     failures: List[str] = field(default_factory=list)
+    surprises: List[str] = field(default_factory=list)
     knowledge_base: Dict = field(default_factory=dict)
 
     def add_cycle(self, cycle_id: int, result: Dict):
@@ -61,6 +62,9 @@ class Memory:
     def add_failure(self, failure: str):
         self.failures.append(failure)
 
+    def add_surprise(self, surprise: str):
+        self.surprises.append(surprise)
+
     def get_context(self) -> str:
         """Build context string for agents."""
         context = []
@@ -68,6 +72,8 @@ class Memory:
             context.append("KEY INSIGHTS:\n" + "\n".join(f"- {i}" for i in self.insights[-5:]))
         if self.failures:
             context.append("KNOWN FAILURES:\n" + "\n".join(f"- {f}" for f in self.failures[-5:]))
+        if self.surprises:
+            context.append("SURPRISE FINDINGS:\n" + "\n".join(f"- {s}" for s in self.surprises[-5:]))
         if self.history:
             recent = self.history[-3:]
             cycle_summaries = []
@@ -78,12 +84,41 @@ class Memory:
             context.append("RECENT CYCLES:\n" + "\n".join(cycle_summaries))
         return "\n\n".join(context) if context else "No prior context."
 
+    def compact(self, keep_full_cycles: int = 3, max_insights: int = 20, max_failures: int = 10):
+        """Compact memory to reduce token usage. Keeps recent cycles in full, summarizes older ones."""
+        # Compact history: keep only summary for old cycles
+        if len(self.history) > keep_full_cycles:
+            old_cycles = self.history[:-keep_full_cycles]
+            recent_cycles = self.history[-keep_full_cycles:]
+
+            # Summarize old cycles to minimal format
+            compacted = []
+            for h in old_cycles:
+                compacted.append({
+                    "cycle_id": h.get("cycle_id"),
+                    "timestamp": h.get("timestamp"),
+                    "hypothesis": (h.get("hypothesis") or "")[:200],  # Truncate
+                    "verdict": h.get("verdict", "unknown"),
+                    "summary": (h.get("key_learning") or h.get("analysis") or "")[:300]
+                })
+            self.history = compacted + recent_cycles
+
+        # Keep only recent insights/failures, deduplicate
+        self.insights = list(dict.fromkeys(self.insights[-max_insights:]))
+        self.failures = list(dict.fromkeys(self.failures[-max_failures:]))
+        self.surprises = list(dict.fromkeys(self.surprises[-max_insights:]))
+
+        return self
+
     def save(self, path: str):
+        # Auto-compact before saving
+        self.compact()
         with open(path, 'w') as f:
             json.dump({
                 "history": self.history,
                 "insights": self.insights,
                 "failures": self.failures,
+                "surprises": self.surprises,
                 "knowledge_base": self.knowledge_base
             }, f, indent=2)
 
@@ -92,6 +127,11 @@ class Memory:
         if os.path.exists(path):
             with open(path, 'r') as f:
                 data = json.load(f)
+                data.setdefault("history", [])
+                data.setdefault("insights", [])
+                data.setdefault("failures", [])
+                data.setdefault("surprises", [])
+                data.setdefault("knowledge_base", {})
                 return cls(**data)
         return cls()
 
@@ -112,7 +152,8 @@ def save_cycle_to_memory(
     analysis: str,
     verdict: str,
     key_learning: str,
-    tool_context: ToolContext
+    surprise: str = "",
+    tool_context: ToolContext = None
 ) -> str:
     """
     Save a completed research cycle to persistent memory.
@@ -142,7 +183,8 @@ def save_cycle_to_memory(
             "gate_decision": gate_decision,
             "analysis": analysis,
             "verdict": verdict,
-            "key_learning": key_learning
+            "key_learning": key_learning,
+            "surprise": surprise
         }
 
         memory.add_cycle(cycle_id, result)
@@ -154,11 +196,38 @@ def save_cycle_to_memory(
         elif verdict_upper == "REFUTED":
             memory.add_failure(f"Cycle {cycle_id}: {key_learning}")
         # INCONCLUSIVE: neither insight nor failure - valuable data but not conclusive
+        if surprise:
+            cleaned = surprise.strip()
+            if cleaned and cleaned.lower() not in {"none", "n/a", "na", "no", "null"}:
+                memory.add_surprise(cleaned)
 
         # Persist to disk
         memory.save(str(MEMORY_FILE))
 
-        return f"Cycle {cycle_id} saved to memory. Total cycles: {len(memory.history)}"
+    return f"Cycle {cycle_id} saved to memory. Total cycles: {len(memory.history)}"
+
+
+def clear_cycle_state(
+    keys: Optional[List[str]] = None,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Clear transient cycle state to avoid stale data when a cycle is rejected or revised.
+
+    Args:
+        keys: Specific state keys to clear; defaults to experiment/analysis outputs.
+    """
+    if tool_context is None:
+        return "No tool_context available; state not cleared."
+
+    keys = keys or [
+        "experiment_code",
+        "analysis",
+        "simple_explanation",
+        "editorial_review",
+    ]
+    tool_context.actions.state_delta = {key: "" for key in keys}
+    return f"Cleared state keys: {', '.join(keys)}"
 
 
 def save_report(
@@ -254,6 +323,7 @@ def get_all_cycles(tool_context: ToolContext = None) -> str:
 
 # Create FunctionTool wrappers
 save_cycle_tool = FunctionTool(func=save_cycle_to_memory)
+clear_cycle_state_tool = FunctionTool(func=clear_cycle_state)
 save_report_tool = FunctionTool(func=save_report)
 get_memory_tool = FunctionTool(func=get_memory_context)
 get_cycles_tool = FunctionTool(func=get_all_cycles)
@@ -296,7 +366,7 @@ RATIONALE: [Why this might work, cite papers if relevant]
 
 Focus on REAL techniques: EWC, SAM, PackNet, memory replay, regularization.
 Do NOT propose vague "novel architectures" - be specific and runnable.""",
-    tools=[google_search, get_memory_tool, get_cycles_tool],
+    tools=[get_memory_tool, get_cycles_tool],
     output_key="hypothesis"
 )
 
@@ -361,12 +431,12 @@ REASONING: [2-3 sentences]
 ACTION: [If REVISE: specific changes. If REJECT: why]
 
 IMPORTANT:
-- If REJECT: You MUST call transfer_to_agent("memory_saver") to skip the experiment phase.
-- If REVISE: You MUST call transfer_to_agent("theorist") to generate a new hypothesis.
+- If REJECT: You MUST call clear_cycle_state, then transfer_to_agent("memory_saver") to skip the experiment phase.
+- If REVISE: You MUST call clear_cycle_state, then transfer_to_agent("theorist") to generate a new hypothesis.
 - If PROCEED: Do NOT call transfer_to_agent, just output your decision and the pipeline continues.
 
 Default to REJECT if uncertain.""",
-    tools=[transfer_to_agent],
+    tools=[transfer_to_agent, clear_cycle_state_tool],
     output_key="gate_decision"
 )
 
@@ -378,7 +448,7 @@ architect = Agent(
     instruction="""You are the ARCHITECT - design MINIMAL runnable experiments.
 
 HYPOTHESIS: {hypothesis}
-GATE DECISION: {gate_decision}
+GATE DECISION: {gate_decision?}
 
 Design the SIMPLEST possible experiment to test this hypothesis.
 
@@ -418,7 +488,7 @@ analyst = Agent(
     instruction="""You are the ANALYST - analyze results with BRUTAL HONESTY.
 
 HYPOTHESIS: {hypothesis}
-EXPERIMENT OUTPUT: {experiment_code}
+EXPERIMENT OUTPUT: {experiment_code?}
 
 The experiment output above contains the code that was designed and executed, along with its results.
 Analyze what actually happened. No spin.
@@ -428,6 +498,7 @@ WHAT HAPPENED: [Raw numbers from output]
 VS BASELINE: [X% vs Y% = delta Z%]
 SIGNIFICANCE: [p-value if available, or "n=1, not significant"]
 VERDICT: [SUPPORTED / REFUTED / INCONCLUSIVE]
+SURPRISES: [Unexpected results or anomalies, or "None"]
 
 HONEST ASSESSMENT: [2-3 sentences]
 NEXT STEPS: [Only if supported]
@@ -444,7 +515,7 @@ teacher = Agent(
     instruction="""You are the TEACHER - explain to a smart 12-year-old.
 
 HYPOTHESIS: {hypothesis}
-ANALYSIS: {analysis}
+ANALYSIS: {analysis?}
 
 Explain what we tried and what happened in simple terms.
 
@@ -472,10 +543,10 @@ editor = Agent(
 CYCLE RESULTS:
 Hypothesis: {hypothesis}
 Critique: {critique}
-Gate Decision: {gate_decision}
-Experiment Code & Output: {experiment_code}
-Analysis: {analysis}
-Simple Explanation: {simple_explanation}
+Gate Decision: {gate_decision?}
+Experiment Code & Output: {experiment_code?}
+Analysis: {analysis?}
+Simple Explanation: {simple_explanation?}
 
 CHECK FOR:
 1. ABSTRACTION TRAP: Did we run code or just talk? Check experiment_code for actual execution output.
@@ -491,7 +562,8 @@ ISSUES FOUND:
 - [Issue 2]
 
 VERDICT: [PUBLISH / REVISE / DISCARD]
-KEY LEARNING: [One sentence for memory]""",
+KEY LEARNING: [One sentence for memory]
+SURPRISES: [Unexpected or notable surprises, or "None"]""",
     output_key="editorial_review"
 )
 
@@ -507,16 +579,18 @@ After each research cycle, extract and save the key information.
 CYCLE DATA:
 Hypothesis: {hypothesis}
 Critique: {critique}
-Gate Decision: {gate_decision}
-Experiment Code & Output: {experiment_code}
-Analysis: {analysis}
-Simple Explanation: {simple_explanation}
-Editorial Review: {editorial_review}
+Gate Decision: {gate_decision?}
+Experiment Code & Output: {experiment_code?}
+Analysis: {analysis?}
+Simple Explanation: {simple_explanation?}
+Editorial Review: {editorial_review?}
 
 YOUR TASK:
 1. Extract the VERDICT from the analysis (SUPPORTED/REFUTED/INCONCLUSIVE)
 2. Extract the KEY LEARNING from the editorial review
-3. Use the save_cycle_to_memory tool to persist this cycle
+3. Extract any SURPRISE FINDING from the analysis or editorial review
+   - Prefer the analyst's SURPRISES field if both are present
+4. Use the save_cycle_to_memory tool to persist this cycle
 
 NOTE: If the gate decision was REJECT, the experiment_code, analysis, and simple_explanation
 may be empty or contain placeholder text. In that case, set verdict to "REJECTED" and
@@ -709,6 +783,7 @@ research_cycle = SequentialAgent(
 root_agent = Agent(
     name="forgetting_lab",
     model=MODEL,
+    include_contents='none',  # Prevent loading full conversation history (token overflow)
     description="Autonomous AI scientist for continual learning research on catastrophic forgetting",
     instruction="""You are FORGETTING LAB - an autonomous AI scientist.
 

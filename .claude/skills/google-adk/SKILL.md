@@ -152,6 +152,26 @@ self._browser: Optional[BrowserContext] = None
 self._browser = playwright.chromium.launch_persistent_context(...)
 ```
 
+### 6. Context overflow from session history (token limit exceeded)
+ADK stores all conversation history in session.db which gets sent to the LLM. This causes "input token count exceeds maximum" errors.
+
+```python
+# WRONG: Agent loads full conversation history (can exceed 128K+ tokens)
+root_agent = Agent(name="my_agent", model=MODEL)
+
+# RIGHT: Prevent loading conversation history
+root_agent = Agent(
+    name="my_agent",
+    model=MODEL,
+    include_contents='none',  # Stateless - no prior context
+)
+```
+
+Also clear `.adk/session.db` files when they grow too large:
+```bash
+rm -rf ika_agent/.adk/session.db
+```
+
 ## Control Flow Actions
 
 ```python

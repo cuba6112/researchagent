@@ -216,7 +216,7 @@ class PlaywrightComputer(BaseComputer):
         def _search():
             self._ensure_browser_sync()
             # Navigate to search engine home (without query)
-            base_url = self._search_engine_url.split("?")[0].rstrip("/search")
+            base_url = self._search_engine_url.split("?")[0].removesuffix("/search")
             self._page.goto(base_url or "https://www.google.com")
             self._page.wait_for_load_state("domcontentloaded")
             return self._get_state_sync()

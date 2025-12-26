@@ -30,10 +30,10 @@ agent1/
 │   ├── __init__.py              # Package init (exports root_agent)
 │   ├── agent.py                 # Core agent definitions (~750 lines)
 │   ├── playwright_computer.py   # Browser automation for computer use
-│   ├── .env                     # API keys (GEMINI_API_KEY)
-│   └── outputs/                 # Persistent storage
-│       ├── memory.json          # Research history, insights, failures
-│       └── reports/             # Generated papers and summaries
+│   └── .env                     # API keys (GEMINI_API_KEY)
+├── outputs/                      # Persistent storage (outside agent package)
+│   ├── memory.json              # Research history, insights, failures
+│   └── reports/                 # Generated papers and summaries
 ├── .claude/
 │   ├── settings.local.json      # Tool permissions
 │   └── skills/                  # Project-local skills
@@ -83,6 +83,8 @@ The Memory dataclass tracks cycle history and provides context to agents.
 Custom `PlaywrightComputer` implementation that wraps Playwright's sync API in a ThreadPoolExecutor to avoid Windows asyncio subprocess issues. Implements the ADK `BaseComputer` interface for browser automation.
 
 ### Models
+
+**DO NOT CHANGE THE MODEL without user permission.**
 
 - Standard agents: `gemini-3-flash-preview`
 - Computer use agent: `gemini-2.5-computer-use-preview-10-2025` (no Gemini 3 version yet)

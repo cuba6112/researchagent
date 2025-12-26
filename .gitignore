@@ -14,7 +14,7 @@ wheels/
 ika_agent/.env
 
 # Research outputs (optional - uncomment to track)
-# ika_agent/outputs/
+# outputs/
 
 # ADK cache
 .adk/

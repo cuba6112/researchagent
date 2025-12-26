@@ -15,7 +15,17 @@ description: Google python-genai SDK for Gemini 3 Flash, Gemini 3 Pro, and Gemin
 | Gemini 2.5 Flash | `gemini-2.5-flash` |
 | Gemini 2.5 Pro | `gemini-2.5-pro` |
 
-**Limits**: 1M input / 64k output tokens
+## Gemini 3 Flash Capabilities
+
+**Token Limits**: 1,048,576 input / 65,536 output (confirmed 1M context)
+
+**Inputs**: Text, Image, Video, Audio, PDF
+
+**Supported**: Batch API, Caching, Code execution, File search, Function calling, Search grounding, Structured outputs, Thinking, URL context
+
+**Not Supported**: Audio generation, Image generation (use gemini-3-pro-image-preview), Live API, Grounding with Google Maps
+
+**Knowledge cutoff**: January 2025
 
 ## Critical: Temperature for Gemini 3
 
