@@ -6,6 +6,11 @@ on catastrophic forgetting in neural networks.
 """
 
 import logging
+import hashlib
+import platform
+import re
+import subprocess
+import uuid
 
 from google.adk import Agent
 from google.adk.agents import SequentialAgent
@@ -47,6 +52,8 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MEMORY_FILE = OUTPUT_DIR / "memory.json"
 REPORTS_DIR = OUTPUT_DIR / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
+EXPERIMENTS_DIR = OUTPUT_DIR / "experiments"
+EXPERIMENTS_DIR.mkdir(exist_ok=True)
 
 # ============================================================================
 # CONFIGURATION
@@ -88,9 +95,39 @@ class AgentConfig:
     browser_screen_size: tuple = (1280, 936)
 
 
+@dataclass(frozen=True)
+class ExperimentConfig:
+    """Configuration for experiment versioning."""
+    # Code extraction patterns
+    code_block_pattern: str = r"```python\s*(.*?)```"
+
+    # Hyperparameter extraction patterns (common ML params)
+    hyperparam_patterns: Tuple[str, ...] = (
+        r"lr\s*=\s*([\d.e-]+)",
+        r"learning_rate\s*=\s*([\d.e-]+)",
+        r"batch_size\s*=\s*(\d+)",
+        r"epochs?\s*=\s*(\d+)",
+        r"num_tasks?\s*=\s*(\d+)",
+        r"hidden_size\s*=\s*(\d+)",
+        r"memory_size\s*=\s*(\d+)",
+        r"buffer_size\s*=\s*(\d+)",
+        r"replay_.*?=\s*(\d+)",
+    )
+
+    # Seed extraction patterns
+    seed_patterns: Tuple[str, ...] = (
+        r"seed\s*=\s*(\d+)",
+        r"random_seed\s*=\s*(\d+)",
+        r"torch\.manual_seed\((\d+)\)",
+        r"np\.random\.seed\((\d+)\)",
+        r"seeds?\s*=\s*\[([\d,\s]+)\]",
+    )
+
+
 # Default configuration instances
 MEMORY_CONFIG = MemoryConfig()
 AGENT_CONFIG = AgentConfig()
+EXPERIMENT_CONFIG = ExperimentConfig()
 
 
 # ============================================================================
@@ -366,6 +403,456 @@ memory_manager = MemoryManager.get()
 
 
 # ============================================================================
+# EXPERIMENT VERSIONING SYSTEM
+# ============================================================================
+
+@dataclass
+class ExperimentVersion:
+    """
+    Complete snapshot of an experiment for reproducibility.
+
+    Captures code, environment, hyperparameters, seeds, and results
+    to enable exact reproduction of any past experiment.
+    """
+    experiment_id: str
+    cycle_id: int
+    timestamp: str
+    hypothesis: str
+
+    # Code snapshot
+    code: str
+    code_hash: str  # SHA256 of code for quick comparison
+
+    # Reproducibility info
+    random_seeds: List[int] = field(default_factory=list)
+    hyperparameters: Dict[str, Any] = field(default_factory=dict)
+
+    # Environment info
+    python_version: str = ""
+    torch_version: str = ""
+    numpy_version: str = ""
+    platform_info: str = ""
+    git_commit: str = ""
+
+    # Results (populated after execution)
+    results: Dict[str, Any] = field(default_factory=dict)
+    execution_output: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "experiment_id": self.experiment_id,
+            "cycle_id": self.cycle_id,
+            "timestamp": self.timestamp,
+            "hypothesis": self.hypothesis,
+            "code": self.code,
+            "code_hash": self.code_hash,
+            "random_seeds": self.random_seeds,
+            "hyperparameters": self.hyperparameters,
+            "python_version": self.python_version,
+            "torch_version": self.torch_version,
+            "numpy_version": self.numpy_version,
+            "platform_info": self.platform_info,
+            "git_commit": self.git_commit,
+            "results": self.results,
+            "execution_output": self.execution_output,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExperimentVersion":
+        """Create ExperimentVersion from dictionary."""
+        return cls(
+            experiment_id=data.get("experiment_id", ""),
+            cycle_id=data.get("cycle_id", 0),
+            timestamp=data.get("timestamp", ""),
+            hypothesis=data.get("hypothesis", ""),
+            code=data.get("code", ""),
+            code_hash=data.get("code_hash", ""),
+            random_seeds=data.get("random_seeds", []),
+            hyperparameters=data.get("hyperparameters", {}),
+            python_version=data.get("python_version", ""),
+            torch_version=data.get("torch_version", ""),
+            numpy_version=data.get("numpy_version", ""),
+            platform_info=data.get("platform_info", ""),
+            git_commit=data.get("git_commit", ""),
+            results=data.get("results", {}),
+            execution_output=data.get("execution_output", ""),
+        )
+
+
+class ExperimentVersionManager:
+    """
+    Manages experiment versions for reproducibility.
+
+    Each experiment is stored in its own directory with:
+    - experiment.py: The exact code that was run
+    - metadata.json: Environment, seeds, hyperparameters
+    - results.json: Execution output and parsed results
+    """
+    _instance: Optional["ExperimentVersionManager"] = None
+    _init_lock = threading.Lock()
+
+    def __init__(self, experiments_dir: Path):
+        """Initialize the experiment version manager."""
+        self._experiments_dir = experiments_dir
+        self._index_path = experiments_dir / "index.json"
+        self._index: Dict[str, Dict[str, Any]] = {}
+        self._load_index()
+        logger.debug(f"ExperimentVersionManager initialized: {experiments_dir}")
+
+    @classmethod
+    def get(cls, experiments_dir: Optional[Path] = None) -> "ExperimentVersionManager":
+        """Get the singleton ExperimentVersionManager instance."""
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    path = experiments_dir or EXPERIMENTS_DIR
+                    cls._instance = cls(path)
+                    logger.info(f"ExperimentVersionManager created: {path}")
+        return cls._instance
+
+    def _load_index(self) -> None:
+        """Load the experiment index from disk."""
+        if self._index_path.exists():
+            with open(self._index_path, 'r') as f:
+                self._index = json.load(f)
+            logger.debug(f"Loaded {len(self._index)} experiments from index")
+        else:
+            self._index = {}
+
+    def _save_index(self) -> None:
+        """Save the experiment index to disk."""
+        with open(self._index_path, 'w') as f:
+            json.dump(self._index, f, indent=2)
+
+    def _get_environment_info(self) -> Dict[str, str]:
+        """Capture current environment information."""
+        env_info = {
+            "python_version": platform.python_version(),
+            "platform_info": f"{platform.system()} {platform.release()}",
+        }
+
+        # Get torch version
+        try:
+            import torch
+            env_info["torch_version"] = torch.__version__
+        except ImportError:
+            env_info["torch_version"] = "not installed"
+
+        # Get numpy version
+        try:
+            import numpy as np
+            env_info["numpy_version"] = np.__version__
+        except ImportError:
+            env_info["numpy_version"] = "not installed"
+
+        # Get git commit hash
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                env_info["git_commit"] = result.stdout.strip()[:12]
+        except Exception:
+            env_info["git_commit"] = "unknown"
+
+        return env_info
+
+    def _extract_code_from_output(self, experiment_output: str) -> str:
+        """Extract Python code from experiment output (code block)."""
+        config = EXPERIMENT_CONFIG
+        matches = re.findall(config.code_block_pattern, experiment_output, re.DOTALL)
+        if matches:
+            return matches[0].strip()
+        # If no code block, try to find code-like content
+        if "import " in experiment_output and "def " in experiment_output:
+            return experiment_output.strip()
+        return ""
+
+    def _extract_seeds(self, code: str) -> List[int]:
+        """Extract random seeds from code."""
+        config = EXPERIMENT_CONFIG
+        seeds = set()
+
+        for pattern in config.seed_patterns:
+            matches = re.findall(pattern, code)
+            for match in matches:
+                if isinstance(match, str) and ',' in match:
+                    # Handle list format: [42, 123, 456]
+                    for s in match.split(','):
+                        s = s.strip()
+                        if s.isdigit():
+                            seeds.add(int(s))
+                elif match.isdigit():
+                    seeds.add(int(match))
+
+        return sorted(list(seeds))
+
+    def _extract_hyperparameters(self, code: str) -> Dict[str, Any]:
+        """Extract hyperparameters from code."""
+        config = EXPERIMENT_CONFIG
+        hyperparams = {}
+
+        for pattern in config.hyperparam_patterns:
+            matches = re.findall(pattern, code, re.IGNORECASE)
+            if matches:
+                # Extract param name from pattern
+                param_name = pattern.split(r"\s*=")[0].replace(r"\s*", "").replace("\\", "")
+                # Clean up the param name
+                param_name = re.sub(r'[^a-zA-Z_]', '', param_name)
+                try:
+                    value = float(matches[0]) if '.' in matches[0] or 'e' in matches[0].lower() else int(matches[0])
+                    hyperparams[param_name] = value
+                except ValueError:
+                    hyperparams[param_name] = matches[0]
+
+        return hyperparams
+
+    def _compute_code_hash(self, code: str) -> str:
+        """Compute SHA256 hash of code for comparison."""
+        return hashlib.sha256(code.encode()).hexdigest()[:16]
+
+    def save_experiment(
+        self,
+        cycle_id: int,
+        hypothesis: str,
+        experiment_output: str,
+        results: Optional[Dict[str, Any]] = None
+    ) -> ExperimentVersion:
+        """
+        Save a new experiment version.
+
+        Args:
+            cycle_id: Research cycle ID
+            hypothesis: The hypothesis being tested
+            experiment_output: Raw output from architect (contains code)
+            results: Optional parsed results dict
+
+        Returns:
+            The saved ExperimentVersion
+        """
+        # Generate unique experiment ID
+        experiment_id = f"exp_{cycle_id:03d}_{uuid.uuid4().hex[:8]}"
+        timestamp = datetime.now().isoformat()
+
+        # Extract code from output
+        code = self._extract_code_from_output(experiment_output)
+        if not code:
+            logger.warning(f"No code found in experiment output for cycle {cycle_id}")
+            code = experiment_output  # Save raw output as fallback
+
+        # Create version
+        env_info = self._get_environment_info()
+        version = ExperimentVersion(
+            experiment_id=experiment_id,
+            cycle_id=cycle_id,
+            timestamp=timestamp,
+            hypothesis=hypothesis,
+            code=code,
+            code_hash=self._compute_code_hash(code),
+            random_seeds=self._extract_seeds(code),
+            hyperparameters=self._extract_hyperparameters(code),
+            python_version=env_info["python_version"],
+            torch_version=env_info["torch_version"],
+            numpy_version=env_info["numpy_version"],
+            platform_info=env_info["platform_info"],
+            git_commit=env_info["git_commit"],
+            results=results or {},
+            execution_output=experiment_output,
+        )
+
+        # Create experiment directory
+        exp_dir = self._experiments_dir / experiment_id
+        exp_dir.mkdir(exist_ok=True)
+
+        # Save code file
+        code_path = exp_dir / "experiment.py"
+        with open(code_path, 'w', encoding='utf-8') as f:
+            f.write(code)
+
+        # Save metadata
+        metadata_path = exp_dir / "metadata.json"
+        metadata = {
+            "experiment_id": version.experiment_id,
+            "cycle_id": version.cycle_id,
+            "timestamp": version.timestamp,
+            "hypothesis": version.hypothesis,
+            "code_hash": version.code_hash,
+            "random_seeds": version.random_seeds,
+            "hyperparameters": version.hyperparameters,
+            "environment": {
+                "python_version": version.python_version,
+                "torch_version": version.torch_version,
+                "numpy_version": version.numpy_version,
+                "platform_info": version.platform_info,
+                "git_commit": version.git_commit,
+            }
+        }
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2)
+
+        # Save results/output
+        results_path = exp_dir / "results.json"
+        results_data = {
+            "execution_output": version.execution_output,
+            "parsed_results": version.results,
+        }
+        with open(results_path, 'w', encoding='utf-8') as f:
+            json.dump(results_data, f, indent=2)
+
+        # Update index
+        self._index[experiment_id] = {
+            "cycle_id": cycle_id,
+            "timestamp": timestamp,
+            "hypothesis": hypothesis[:100],
+            "code_hash": version.code_hash,
+        }
+        self._save_index()
+
+        logger.info(f"Saved experiment {experiment_id} (cycle {cycle_id}, hash={version.code_hash})")
+        return version
+
+    def get_experiment(self, experiment_id: str) -> Optional[ExperimentVersion]:
+        """Load an experiment by ID."""
+        exp_dir = self._experiments_dir / experiment_id
+
+        if not exp_dir.exists():
+            logger.warning(f"Experiment not found: {experiment_id}")
+            return None
+
+        # Load code
+        code_path = exp_dir / "experiment.py"
+        code = ""
+        if code_path.exists():
+            with open(code_path, 'r', encoding='utf-8') as f:
+                code = f.read()
+
+        # Load metadata
+        metadata_path = exp_dir / "metadata.json"
+        metadata = {}
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+
+        # Load results
+        results_path = exp_dir / "results.json"
+        results_data = {}
+        if results_path.exists():
+            with open(results_path, 'r') as f:
+                results_data = json.load(f)
+
+        env = metadata.get("environment", {})
+        return ExperimentVersion(
+            experiment_id=experiment_id,
+            cycle_id=metadata.get("cycle_id", 0),
+            timestamp=metadata.get("timestamp", ""),
+            hypothesis=metadata.get("hypothesis", ""),
+            code=code,
+            code_hash=metadata.get("code_hash", ""),
+            random_seeds=metadata.get("random_seeds", []),
+            hyperparameters=metadata.get("hyperparameters", {}),
+            python_version=env.get("python_version", ""),
+            torch_version=env.get("torch_version", ""),
+            numpy_version=env.get("numpy_version", ""),
+            platform_info=env.get("platform_info", ""),
+            git_commit=env.get("git_commit", ""),
+            results=results_data.get("parsed_results", {}),
+            execution_output=results_data.get("execution_output", ""),
+        )
+
+    def get_experiment_by_cycle(self, cycle_id: int) -> Optional[ExperimentVersion]:
+        """Get the experiment for a specific cycle."""
+        for exp_id, info in self._index.items():
+            if info.get("cycle_id") == cycle_id:
+                return self.get_experiment(exp_id)
+        return None
+
+    def list_experiments(self) -> List[Dict[str, Any]]:
+        """List all experiments with summary info."""
+        experiments = []
+        for exp_id, info in sorted(self._index.items(), key=lambda x: x[1].get("cycle_id", 0)):
+            experiments.append({
+                "experiment_id": exp_id,
+                "cycle_id": info.get("cycle_id"),
+                "timestamp": info.get("timestamp"),
+                "hypothesis": info.get("hypothesis", "")[:80] + "...",
+                "code_hash": info.get("code_hash"),
+            })
+        return experiments
+
+    def compare_experiments(self, exp_id_1: str, exp_id_2: str) -> Dict[str, Any]:
+        """Compare two experiments and highlight differences."""
+        exp1 = self.get_experiment(exp_id_1)
+        exp2 = self.get_experiment(exp_id_2)
+
+        if not exp1 or not exp2:
+            return {"error": "One or both experiments not found"}
+
+        comparison = {
+            "experiment_1": exp_id_1,
+            "experiment_2": exp_id_2,
+            "same_code": exp1.code_hash == exp2.code_hash,
+            "code_hash_1": exp1.code_hash,
+            "code_hash_2": exp2.code_hash,
+            "seed_diff": {
+                "only_in_1": [s for s in exp1.random_seeds if s not in exp2.random_seeds],
+                "only_in_2": [s for s in exp2.random_seeds if s not in exp1.random_seeds],
+            },
+            "hyperparam_diff": {},
+            "environment_diff": {},
+        }
+
+        # Compare hyperparameters
+        all_params = set(exp1.hyperparameters.keys()) | set(exp2.hyperparameters.keys())
+        for param in all_params:
+            v1 = exp1.hyperparameters.get(param)
+            v2 = exp2.hyperparameters.get(param)
+            if v1 != v2:
+                comparison["hyperparam_diff"][param] = {"exp1": v1, "exp2": v2}
+
+        # Compare environment
+        env_fields = ["python_version", "torch_version", "numpy_version"]
+        for field in env_fields:
+            v1 = getattr(exp1, field)
+            v2 = getattr(exp2, field)
+            if v1 != v2:
+                comparison["environment_diff"][field] = {"exp1": v1, "exp2": v2}
+
+        return comparison
+
+    def generate_rerun_command(self, experiment_id: str) -> str:
+        """Generate a command to re-run an experiment."""
+        exp = self.get_experiment(experiment_id)
+        if not exp:
+            return f"# Experiment {experiment_id} not found"
+
+        exp_dir = self._experiments_dir / experiment_id
+        code_path = exp_dir / "experiment.py"
+
+        return f"""# Re-run experiment {experiment_id} (Cycle {exp.cycle_id})
+# Original timestamp: {exp.timestamp}
+# Git commit: {exp.git_commit}
+# Seeds: {exp.random_seeds}
+# Hyperparameters: {json.dumps(exp.hyperparameters)}
+
+cd {exp_dir}
+python experiment.py
+"""
+
+    @property
+    def experiment_count(self) -> int:
+        """Get total number of saved experiments."""
+        return len(self._index)
+
+
+# Create singleton instance
+experiment_manager = ExperimentVersionManager.get()
+
+
+# ============================================================================
 # FILE-WRITING TOOLS
 # ============================================================================
 
@@ -551,6 +1038,237 @@ clear_cycle_state_tool = FunctionTool(func=clear_cycle_state)
 save_report_tool = FunctionTool(func=save_report)
 get_memory_tool = FunctionTool(func=get_memory_context)
 get_cycles_tool = FunctionTool(func=get_all_cycles)
+
+
+# ============================================================================
+# EXPERIMENT VERSIONING TOOLS
+# ============================================================================
+
+def save_experiment_version(
+    hypothesis: str,
+    experiment_output: str,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Save an experiment version with code snapshot and environment info.
+
+    Automatically extracts:
+    - Python code from the experiment output
+    - Random seeds used
+    - Hyperparameters (lr, batch_size, epochs, etc.)
+    - Environment info (Python, PyTorch, NumPy versions)
+    - Git commit hash
+
+    Args:
+        hypothesis: The hypothesis being tested
+        experiment_output: Raw output from architect (contains code and results)
+
+    Returns:
+        Confirmation with experiment ID and extracted info
+    """
+    # Get current cycle ID from memory
+    memory = memory_manager.load()
+    cycle_id = len(memory.history) + 1
+
+    # Save experiment
+    version = experiment_manager.save_experiment(
+        cycle_id=cycle_id,
+        hypothesis=hypothesis,
+        experiment_output=experiment_output,
+    )
+
+    return f"""Experiment saved:
+- ID: {version.experiment_id}
+- Cycle: {version.cycle_id}
+- Code hash: {version.code_hash}
+- Seeds: {version.random_seeds}
+- Hyperparameters: {json.dumps(version.hyperparameters)}
+- Environment: Python {version.python_version}, PyTorch {version.torch_version}
+- Git commit: {version.git_commit}
+- Code saved to: outputs/experiments/{version.experiment_id}/experiment.py"""
+
+
+def get_experiment_version(
+    experiment_id: Optional[str] = None,
+    cycle_id: Optional[int] = None,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Retrieve an experiment version by ID or cycle number.
+
+    Args:
+        experiment_id: Experiment ID (e.g., "exp_001_abc12345")
+        cycle_id: Alternatively, retrieve by cycle number
+
+    Returns:
+        Experiment details including code, seeds, hyperparameters, and environment
+    """
+    version = None
+
+    if experiment_id:
+        version = experiment_manager.get_experiment(experiment_id)
+    elif cycle_id:
+        version = experiment_manager.get_experiment_by_cycle(cycle_id)
+    else:
+        return "Please provide either experiment_id or cycle_id"
+
+    if not version:
+        return f"Experiment not found (id={experiment_id}, cycle={cycle_id})"
+
+    return f"""## Experiment: {version.experiment_id}
+
+**Cycle:** {version.cycle_id}
+**Timestamp:** {version.timestamp}
+**Code Hash:** {version.code_hash}
+
+### Hypothesis
+{version.hypothesis[:200]}...
+
+### Reproducibility Info
+- **Seeds:** {version.random_seeds}
+- **Hyperparameters:** {json.dumps(version.hyperparameters, indent=2)}
+
+### Environment
+- Python: {version.python_version}
+- PyTorch: {version.torch_version}
+- NumPy: {version.numpy_version}
+- Platform: {version.platform_info}
+- Git Commit: {version.git_commit}
+
+### Code
+```python
+{version.code[:500]}...
+```
+
+### Re-run Command
+```bash
+cd outputs/experiments/{version.experiment_id}
+python experiment.py
+```"""
+
+
+def list_experiment_versions(
+    limit: int = 10,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    List all saved experiment versions.
+
+    Args:
+        limit: Maximum number of experiments to list (default 10)
+
+    Returns:
+        Table of experiments with IDs, cycles, timestamps, and code hashes
+    """
+    experiments = experiment_manager.list_experiments()
+
+    if not experiments:
+        return "No experiments have been saved yet."
+
+    output = ["## Saved Experiments\n"]
+    output.append("| Cycle | Experiment ID | Timestamp | Code Hash |")
+    output.append("|-------|---------------|-----------|-----------|")
+
+    for exp in experiments[-limit:]:
+        timestamp = exp["timestamp"][:19] if exp["timestamp"] else "N/A"
+        output.append(
+            f"| {exp['cycle_id']} | {exp['experiment_id']} | {timestamp} | {exp['code_hash']} |"
+        )
+
+    output.append(f"\nTotal experiments: {len(experiments)}")
+    return "\n".join(output)
+
+
+def compare_experiments(
+    experiment_id_1: str,
+    experiment_id_2: str,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Compare two experiments to identify differences.
+
+    Compares:
+    - Code (by hash)
+    - Random seeds
+    - Hyperparameters
+    - Environment versions
+
+    Args:
+        experiment_id_1: First experiment ID
+        experiment_id_2: Second experiment ID
+
+    Returns:
+        Detailed comparison showing what differs between experiments
+    """
+    comparison = experiment_manager.compare_experiments(experiment_id_1, experiment_id_2)
+
+    if "error" in comparison:
+        return comparison["error"]
+
+    output = [f"## Comparison: {experiment_id_1} vs {experiment_id_2}\n"]
+
+    # Code comparison
+    if comparison["same_code"]:
+        output.append("✅ **Code:** Identical (same hash)")
+    else:
+        output.append(f"❌ **Code:** Different")
+        output.append(f"   - Exp 1 hash: {comparison['code_hash_1']}")
+        output.append(f"   - Exp 2 hash: {comparison['code_hash_2']}")
+
+    # Seed comparison
+    seed_diff = comparison["seed_diff"]
+    if not seed_diff["only_in_1"] and not seed_diff["only_in_2"]:
+        output.append("✅ **Seeds:** Identical")
+    else:
+        output.append("❌ **Seeds:** Different")
+        if seed_diff["only_in_1"]:
+            output.append(f"   - Only in exp 1: {seed_diff['only_in_1']}")
+        if seed_diff["only_in_2"]:
+            output.append(f"   - Only in exp 2: {seed_diff['only_in_2']}")
+
+    # Hyperparameter comparison
+    hp_diff = comparison["hyperparam_diff"]
+    if not hp_diff:
+        output.append("✅ **Hyperparameters:** Identical")
+    else:
+        output.append("❌ **Hyperparameters:** Different")
+        for param, values in hp_diff.items():
+            output.append(f"   - {param}: {values['exp1']} → {values['exp2']}")
+
+    # Environment comparison
+    env_diff = comparison["environment_diff"]
+    if not env_diff:
+        output.append("✅ **Environment:** Identical")
+    else:
+        output.append("⚠️ **Environment:** Different")
+        for field, values in env_diff.items():
+            output.append(f"   - {field}: {values['exp1']} → {values['exp2']}")
+
+    return "\n".join(output)
+
+
+def get_rerun_command(
+    experiment_id: str,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Generate a command to re-run an experiment.
+
+    Args:
+        experiment_id: The experiment to re-run
+
+    Returns:
+        Shell command with context about the original experiment
+    """
+    return experiment_manager.generate_rerun_command(experiment_id)
+
+
+# Create experiment versioning FunctionTool wrappers
+save_experiment_tool = FunctionTool(func=save_experiment_version)
+get_experiment_tool = FunctionTool(func=get_experiment_version)
+list_experiments_tool = FunctionTool(func=list_experiment_versions)
+compare_experiments_tool = FunctionTool(func=compare_experiments)
+rerun_experiment_tool = FunctionTool(func=get_rerun_command)
 
 
 # ============================================================================
@@ -806,8 +1524,8 @@ SURPRISES: [Unexpected or notable surprises, or "None"]""",
 memory_saver = Agent(
     name="memory_saver",
     model=MODEL,
-    description="Saves research cycle results to persistent memory",
-    instruction="""You are the MEMORY SAVER - you persist research findings.
+    description="Saves research cycle results to persistent memory and experiment versions",
+    instruction="""You are the MEMORY SAVER - you persist research findings and experiment versions.
 
 After each research cycle, extract and save the key information.
 
@@ -820,19 +1538,27 @@ Analysis: {analysis?}
 Simple Explanation: {simple_explanation?}
 Editorial Review: {editorial_review?}
 
-YOUR TASK:
-1. Extract the VERDICT from the analysis (SUPPORTED/REFUTED/INCONCLUSIVE)
-2. Extract the KEY LEARNING from the editorial review
-3. Extract any SURPRISE FINDING from the analysis or editorial review
-   - Prefer the analyst's SURPRISES field if both are present
-4. Use the save_cycle_to_memory tool to persist this cycle
+YOUR TASKS:
 
-NOTE: If the gate decision was REJECT, the experiment_code, analysis, and simple_explanation
-may be empty or contain placeholder text. In that case, set verdict to "REJECTED" and
-extract key learning from the gate_decision reasoning.
+1. SAVE RESEARCH CYCLE TO MEMORY:
+   - Extract the VERDICT from the analysis (SUPPORTED/REFUTED/INCONCLUSIVE)
+   - Extract the KEY LEARNING from the editorial review
+   - Extract any SURPRISE FINDING from the analysis or editorial review
+     (prefer the analyst's SURPRISES field if both are present)
+   - Use the save_cycle_to_memory tool to persist this cycle
+
+2. SAVE EXPERIMENT VERSION (if experiment was run):
+   - If experiment_code contains actual Python code (not empty/placeholder):
+   - Use save_experiment_version tool with:
+     - hypothesis: the tested hypothesis
+     - experiment_output: the full experiment_code field
+   - This saves a reproducible snapshot with code, seeds, hyperparameters, and environment
+
+NOTE: If the gate decision was REJECT, skip the experiment version save.
+Set verdict to "REJECTED" and extract key learning from the gate_decision reasoning.
 
 Be concise and accurate. Extract exact values, don't paraphrase.""",
-    tools=[save_cycle_tool],
+    tools=[save_cycle_tool, save_experiment_tool],
     output_key="memory_save_result"
 )
 
@@ -1032,7 +1758,7 @@ Each research cycle follows this pipeline:
 5. ANALYST - provides honest numerical analysis
 6. TEACHER - explains findings simply
 7. EDITOR - reviews for scientific rigor
-8. MEMORY SAVER - persists findings to disk
+8. MEMORY SAVER - persists findings and experiment versions to disk
 
 COMMANDS:
 - "run cycle" - Execute one complete research cycle (auto-saves to memory)
@@ -1040,6 +1766,14 @@ COMMANDS:
 - "report" or "write paper" - Transfer to REPORTER to generate a scientific paper
 - "show memory" - Display past insights and failures using get_memory_context tool
 - "show all cycles" - Display all past research cycles using get_all_cycles tool
+
+EXPERIMENT VERSIONING:
+Each experiment is automatically versioned with code snapshots, random seeds,
+hyperparameters, and environment info for full reproducibility.
+- "list experiments" - Show all saved experiment versions
+- "show experiment <id or cycle>" - Display experiment details including code and environment
+- "compare experiments <id1> <id2>" - Compare two experiments to see differences
+- "rerun experiment <id>" - Get command to re-run a past experiment
 
 MEMORY SYSTEM:
 All research cycles are automatically saved to disk. Use the memory tools to:
@@ -1057,7 +1791,15 @@ BROWSER RESEARCH:
   to find papers, code, and benchmark results.
   (Requires playwright to be installed)""",
     sub_agents=[research_cycle, reporter, synthesizer] + ([browser_researcher] if browser_researcher else []),
-    tools=[get_memory_tool, get_cycles_tool]
+    tools=[
+        get_memory_tool,
+        get_cycles_tool,
+        list_experiments_tool,
+        get_experiment_tool,
+        compare_experiments_tool,
+        rerun_experiment_tool,
+    ]
 )
 
 logger.info(f"Forgetting Lab initialized with {memory_manager.cycle_count} existing research cycles")
+logger.info(f"Experiment versions saved: {experiment_manager.experiment_count}")

@@ -33,7 +33,13 @@ agent1/
 │   └── .env                     # API keys (GEMINI_API_KEY)
 ├── outputs/                      # Persistent storage (outside agent package)
 │   ├── memory.json              # Research history, insights, failures
-│   └── reports/                 # Generated papers and summaries
+│   ├── reports/                 # Generated papers and summaries
+│   └── experiments/             # Versioned experiment snapshots
+│       ├── index.json           # Experiment index for quick lookup
+│       └── exp_XXX_XXXXXXXX/    # Per-experiment directories
+│           ├── experiment.py    # Exact code that was run
+│           ├── metadata.json    # Seeds, hyperparams, environment
+│           └── results.json     # Execution output
 ├── .claude/
 │   ├── settings.local.json      # Tool permissions
 │   └── skills/                  # Project-local skills
@@ -72,11 +78,30 @@ Additional standalone agents:
 
 ### Memory System
 
-Persistent memory stored in `ika_agent/outputs/`:
+Persistent memory stored in `outputs/`:
 - `memory.json` - Research history, insights, and failures
 - `reports/` - Generated papers and summaries
 
-The Memory dataclass tracks cycle history and provides context to agents.
+The `MemoryManager` singleton provides thread-safe and process-safe access to memory with file-level locking.
+
+### Experiment Versioning System
+
+The `ExperimentVersionManager` saves reproducible experiment snapshots in `outputs/experiments/`:
+
+Each experiment captures:
+- **Code snapshot** - Exact Python code that was run (with SHA256 hash)
+- **Random seeds** - Auto-extracted from code patterns
+- **Hyperparameters** - Auto-extracted (lr, batch_size, epochs, etc.)
+- **Environment** - Python, PyTorch, NumPy versions, git commit
+- **Results** - Full execution output
+
+Commands available through root agent:
+- `list experiments` - Show all saved experiment versions
+- `show experiment <id or cycle>` - Display experiment details
+- `compare experiments <id1> <id2>` - Diff two experiments
+- `rerun experiment <id>` - Get command to re-run
+
+The Memory Saver agent automatically saves experiment versions after each successful cycle.
 
 ### Computer Use (`ika_agent/playwright_computer.py`)
 
