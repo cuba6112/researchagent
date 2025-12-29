@@ -1,0 +1,24 @@
+{
+  "experiment_id": "exp_010_af3815b7",
+  "cycle_id": 10,
+  "timestamp": "2025-12-29T01:57:10.090254",
+  "hypothesis": "The previously observed failure of Sharpness-Aware Minimization (SAM) in Experience Replay (Cycle 2) was primarily caused by the interaction between \"Batch Normalization noise\" and \"New-Task Gradient Dominance\"; combining SAM with a Group Normalization and Weight Standardization (GN+WS) backbone and a \"Balanced-Gradient\" perturbation\u2014where the SAM perturbation $\\epsilon$ is computed from the sum of the unit-normalized mean gradients of the current task and the replay buffer\u2014will yield a 1.5% improvement in final average accuracy on SplitCIFAR-10 compared to the current best-performing baseline.",
+  "code_hash": "2e5033c35a5dd4d6",
+  "random_seeds": [
+    42,
+    43,
+    44
+  ],
+  "hyperparameters": {
+    "lr": 0.1,
+    "batch_size": 32,
+    "epochs": 1
+  },
+  "environment": {
+    "python_version": "3.12.11",
+    "torch_version": "2.9.1+cpu",
+    "numpy_version": "2.4.0",
+    "platform_info": "Windows 11",
+    "git_commit": "6e72bc5b87ad"
+  }
+}

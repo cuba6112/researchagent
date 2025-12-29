@@ -1,0 +1,43 @@
+{
+  "metrics": [
+    {
+      "cycle_id": 10,
+      "experiment_id": "exp_010_af3815b7",
+      "timestamp": "2025-12-29T12:11:38.244724",
+      "metric_name": "accuracy",
+      "value": 72.5,
+      "tags": [
+        "sam",
+        "experience-replay"
+      ]
+    },
+    {
+      "cycle_id": 10,
+      "experiment_id": "exp_010_af3815b7",
+      "timestamp": "2025-12-29T12:11:38.244724",
+      "metric_name": "baseline",
+      "value": 68.2,
+      "tags": [
+        "sam",
+        "experience-replay"
+      ]
+    },
+    {
+      "cycle_id": 10,
+      "experiment_id": "exp_010_af3815b7",
+      "timestamp": "2025-12-29T12:11:38.244724",
+      "metric_name": "delta",
+      "value": 4.3,
+      "tags": [
+        "sam",
+        "experience-replay"
+      ]
+    }
+  ],
+  "tags_index": {
+    "exp_010_af3815b7": [
+      "sam",
+      "experience-replay"
+    ]
+  }
+}

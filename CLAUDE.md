@@ -121,6 +121,27 @@ Commands available through root agent:
 
 Metrics are automatically recorded by the Memory Saver agent after each experiment.
 
+### Hypothesis Novelty Checker
+
+The `HypothesisSimilarityChecker` prevents redundant research by comparing new hypotheses against past ones:
+
+- **Jaccard similarity** - Tokenized text comparison with stopword filtering
+- **Warning thresholds** - Medium warning at 60%, high warning at 80% similarity
+- **Cluster detection** - Identifies groups of similar research directions
+- **Integrated with Theorist** - The Theorist agent automatically checks novelty before proposing
+
+Commands available through root agent:
+- `check novelty <hypothesis>` - Check if a hypothesis is similar to past ones
+- `similarity matrix` - Show similarity relationships between all past hypotheses
+- `health check` - Run system health check including hypothesis diversity analysis
+
+### Data Backfill Utilities
+
+Utilities to maintain data consistency and recover missing metrics:
+
+- `backfill metrics` - Extract metrics from past cycle analyses that weren't tracked
+- Automatic tagging based on hypothesis content (sam, swa, replay, normalization, etc.)
+
 ### Computer Use (`ika_agent/playwright_computer.py`)
 
 Custom `PlaywrightComputer` implementation that wraps Playwright's sync API in a ThreadPoolExecutor to avoid Windows asyncio subprocess issues. Implements the ADK `BaseComputer` interface for browser automation.

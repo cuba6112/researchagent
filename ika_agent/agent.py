@@ -143,6 +143,26 @@ class MetricsConfig:
     )
 
 
+@dataclass(frozen=True)
+class SimilarityConfig:
+    """Configuration for hypothesis similarity checking."""
+    # Similarity thresholds
+    warning_threshold: float = 0.6  # Warn if similarity > this
+    reject_threshold: float = 0.8  # Strongly advise against if > this
+
+    # Tokenization settings
+    min_word_length: int = 3  # Skip short words like "a", "an", "the"
+    stopwords: Tuple[str, ...] = (
+        "the", "a", "an", "in", "on", "to", "for", "of", "and", "or",
+        "will", "with", "that", "this", "from", "by", "be", "is", "are",
+        "was", "were", "been", "being", "have", "has", "had", "do", "does",
+        "did", "can", "could", "would", "should", "may", "might", "must",
+    )
+
+
+SIMILARITY_CONFIG = SimilarityConfig()
+
+
 # Default configuration instances
 MEMORY_CONFIG = MemoryConfig()
 AGENT_CONFIG = AgentConfig()
@@ -1142,6 +1162,149 @@ metrics_tracker = MetricsTracker.get()
 
 
 # ============================================================================
+# HYPOTHESIS SIMILARITY CHECKER
+# ============================================================================
+
+class HypothesisSimilarityChecker:
+    """
+    Checks new hypotheses against past ones to prevent redundant research.
+
+    Uses Jaccard similarity on tokenized hypotheses to identify when a new
+    hypothesis is too similar to previously tested ones.
+    """
+    _instance: Optional["HypothesisSimilarityChecker"] = None
+    _init_lock = threading.Lock()
+
+    def __init__(self, config: Optional[SimilarityConfig] = None):
+        self._config = config or SIMILARITY_CONFIG
+        logger.debug("HypothesisSimilarityChecker initialized")
+
+    @classmethod
+    def get(cls, config: Optional[SimilarityConfig] = None) -> "HypothesisSimilarityChecker":
+        """Get the singleton instance."""
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    cls._instance = cls(config)
+                    logger.info("HypothesisSimilarityChecker created")
+        return cls._instance
+
+    def _tokenize(self, text: str) -> set:
+        """Tokenize text into a set of meaningful words."""
+        # Lowercase and extract words
+        words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
+
+        # Filter by length and stopwords
+        config = self._config
+        filtered = {
+            w for w in words
+            if len(w) >= config.min_word_length and w not in config.stopwords
+        }
+        return filtered
+
+    def compute_similarity(self, text1: str, text2: str) -> float:
+        """
+        Compute Jaccard similarity between two texts.
+
+        Returns a value between 0 (no overlap) and 1 (identical).
+        """
+        tokens1 = self._tokenize(text1)
+        tokens2 = self._tokenize(text2)
+
+        if not tokens1 or not tokens2:
+            return 0.0
+
+        intersection = len(tokens1 & tokens2)
+        union = len(tokens1 | tokens2)
+
+        return intersection / union if union > 0 else 0.0
+
+    def find_similar_hypotheses(
+        self,
+        new_hypothesis: str,
+        memory: Optional[Memory] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Find past hypotheses similar to the new one.
+
+        Returns a list of similar hypotheses with their cycle IDs and similarity scores.
+        """
+        mem = memory or memory_manager.memory
+        similar = []
+
+        for cycle in mem.history:
+            past_hypothesis = cycle.get("hypothesis", "")
+            if not past_hypothesis:
+                continue
+
+            similarity = self.compute_similarity(new_hypothesis, past_hypothesis)
+            if similarity >= self._config.warning_threshold:
+                similar.append({
+                    "cycle_id": cycle.get("cycle_id"),
+                    "similarity": round(similarity, 3),
+                    "verdict": cycle.get("verdict", "unknown"),
+                    "hypothesis_preview": past_hypothesis[:100] + "...",
+                })
+
+        # Sort by similarity descending
+        similar.sort(key=lambda x: -x["similarity"])
+        return similar
+
+    def check_novelty(
+        self,
+        new_hypothesis: str,
+        memory: Optional[Memory] = None
+    ) -> Dict[str, Any]:
+        """
+        Check if a hypothesis is sufficiently novel.
+
+        Returns a novelty report with warnings if the hypothesis is too similar
+        to past tested hypotheses.
+        """
+        similar = self.find_similar_hypotheses(new_hypothesis, memory)
+
+        if not similar:
+            return {
+                "is_novel": True,
+                "warning_level": "none",
+                "message": "Hypothesis appears novel - no similar past hypotheses found.",
+                "similar_hypotheses": [],
+            }
+
+        max_similarity = similar[0]["similarity"] if similar else 0.0
+        config = self._config
+
+        if max_similarity >= config.reject_threshold:
+            warning_level = "high"
+            message = (
+                f"[!] HIGH SIMILARITY WARNING: This hypothesis is {max_similarity:.0%} similar "
+                f"to Cycle {similar[0]['cycle_id']} which was {similar[0]['verdict']}. "
+                "Consider a substantially different approach."
+            )
+        elif max_similarity >= config.warning_threshold:
+            warning_level = "medium"
+            message = (
+                f"[*] MODERATE SIMILARITY: This hypothesis shares {max_similarity:.0%} overlap "
+                f"with Cycle {similar[0]['cycle_id']} ({similar[0]['verdict']}). "
+                "Ensure you're testing a meaningfully different aspect."
+            )
+        else:
+            warning_level = "none"
+            message = "Hypothesis appears sufficiently novel."
+
+        return {
+            "is_novel": warning_level == "none",
+            "warning_level": warning_level,
+            "message": message,
+            "similar_hypotheses": similar[:3],  # Top 3 most similar
+        }
+
+
+# Create singleton instance
+similarity_checker = HypothesisSimilarityChecker.get()
+
+
+# ============================================================================
 # FILE-WRITING TOOLS
 # ============================================================================
 
@@ -1726,6 +1889,291 @@ progress_dashboard_tool = FunctionTool(func=get_progress_dashboard)
 
 
 # ============================================================================
+# HYPOTHESIS NOVELTY TOOLS
+# ============================================================================
+
+def check_hypothesis_novelty(
+    hypothesis: str,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Check if a hypothesis is sufficiently novel compared to past research.
+
+    Compares the proposed hypothesis against all previously tested hypotheses
+    using text similarity. Warns if the hypothesis is too similar to past ones.
+
+    Args:
+        hypothesis: The proposed hypothesis to check
+
+    Returns:
+        Novelty report with warnings if the hypothesis is too similar to past ones
+    """
+    result = similarity_checker.check_novelty(hypothesis)
+
+    output = [f"## Hypothesis Novelty Check\n"]
+    output.append(result["message"])
+
+    if result["similar_hypotheses"]:
+        output.append("\n### Similar Past Hypotheses:")
+        for past in result["similar_hypotheses"]:
+            output.append(f"\n**Cycle {past['cycle_id']}** ({past['similarity']:.0%} similar)")
+            output.append(f"- Verdict: {past['verdict']}")
+            output.append(f"- Preview: {past['hypothesis_preview']}")
+
+    return "\n".join(output)
+
+
+def get_hypothesis_similarity_matrix(
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Generate a similarity matrix showing relationships between all past hypotheses.
+
+    Useful for understanding which research directions have been explored and
+    identifying clusters of similar approaches.
+
+    Returns:
+        A formatted report showing hypothesis clusters and similarity patterns
+    """
+    memory = memory_manager.memory
+    if len(memory.history) < 2:
+        return "Need at least 2 cycles to compute similarity matrix."
+
+    # Compute pairwise similarities
+    cycles = memory.history
+    n = len(cycles)
+    similarities = []
+
+    for i in range(n):
+        h1 = cycles[i].get("hypothesis", "")
+        for j in range(i + 1, n):
+            h2 = cycles[j].get("hypothesis", "")
+            sim = similarity_checker.compute_similarity(h1, h2)
+            if sim >= 0.4:  # Only show non-trivial similarities
+                similarities.append({
+                    "cycle_a": cycles[i].get("cycle_id"),
+                    "cycle_b": cycles[j].get("cycle_id"),
+                    "similarity": sim,
+                    "verdict_a": cycles[i].get("verdict", "unknown"),
+                    "verdict_b": cycles[j].get("verdict", "unknown"),
+                })
+
+    # Sort by similarity
+    similarities.sort(key=lambda x: -x["similarity"])
+
+    output = ["## Hypothesis Similarity Analysis\n"]
+    output.append(f"Analyzed {n} cycles for hypothesis similarity.\n")
+
+    if similarities:
+        output.append("### Notable Similarities (>=40%)")
+        output.append("| Cycle A | Cycle B | Similarity | Verdicts |")
+        output.append("|---------|---------|------------|----------|")
+        for s in similarities[:10]:  # Top 10
+            output.append(
+                f"| {s['cycle_a']} | {s['cycle_b']} | {s['similarity']:.0%} | "
+                f"{s['verdict_a']}/{s['verdict_b']} |"
+            )
+    else:
+        output.append("No hypothesis pairs with >=40% similarity found.")
+
+    # Find clusters (simple greedy approach)
+    output.append("\n### Research Theme Clusters")
+    clustered = set()
+    clusters = []
+
+    for s in similarities:
+        if s["similarity"] >= 0.5:
+            a, b = s["cycle_a"], s["cycle_b"]
+            # Find or create cluster
+            found = False
+            for cluster in clusters:
+                if a in cluster or b in cluster:
+                    cluster.add(a)
+                    cluster.add(b)
+                    found = True
+                    break
+            if not found:
+                clusters.append({a, b})
+            clustered.add(a)
+            clustered.add(b)
+
+    if clusters:
+        for i, cluster in enumerate(clusters, 1):
+            output.append(f"- **Cluster {i}:** Cycles {sorted(cluster)}")
+    else:
+        output.append("No clear hypothesis clusters detected.")
+
+    return "\n".join(output)
+
+
+# Create hypothesis novelty FunctionTool wrappers
+check_novelty_tool = FunctionTool(func=check_hypothesis_novelty)
+similarity_matrix_tool = FunctionTool(func=get_hypothesis_similarity_matrix)
+
+
+# ============================================================================
+# DATA BACKFILL UTILITIES
+# ============================================================================
+
+def backfill_metrics_from_memory(
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Backfill metrics from past research cycles that weren't tracked.
+
+    Extracts accuracy and other metrics from the analysis field of past cycles
+    and records them in the metrics tracker.
+
+    Returns:
+        Summary of backfilled metrics
+    """
+    memory = memory_manager.memory
+    backfilled = []
+
+    for cycle in memory.history:
+        cycle_id = cycle.get("cycle_id")
+        analysis = cycle.get("analysis", "")
+
+        if not analysis:
+            continue
+
+        # Check if we already have metrics for this cycle
+        existing = [m for m in metrics_tracker._metrics if m.cycle_id == cycle_id]
+        if existing:
+            continue
+
+        # Extract metrics from analysis
+        metrics = metrics_tracker.extract_metrics(analysis)
+
+        if metrics:
+            # Create a pseudo experiment ID for backfilled data
+            experiment_id = f"backfill_cycle_{cycle_id:03d}"
+
+            # Determine tags from hypothesis content
+            hypothesis = cycle.get("hypothesis", "").lower()
+            tags = []
+            if "sam" in hypothesis or "sharpness" in hypothesis:
+                tags.append("sam")
+            if "swa" in hypothesis or "averaging" in hypothesis:
+                tags.append("swa")
+            if "replay" in hypothesis or "memory" in hypothesis:
+                tags.append("replay")
+            if "ewc" in hypothesis:
+                tags.append("ewc")
+            if "normalization" in hypothesis or "gn" in hypothesis or "bn" in hypothesis:
+                tags.append("normalization")
+            if "distillation" in hypothesis or "feature" in hypothesis:
+                tags.append("distillation")
+
+            tags.append(cycle.get("verdict", "unknown").lower())
+
+            # Record metrics
+            metrics_tracker.record_metrics(
+                cycle_id=cycle_id,
+                experiment_id=experiment_id,
+                metrics=metrics,
+                tags=tags
+            )
+
+            backfilled.append({
+                "cycle_id": cycle_id,
+                "metrics": metrics,
+                "tags": tags,
+            })
+
+    if not backfilled:
+        return "No new metrics to backfill. All cycles already have metrics recorded."
+
+    output = [f"## Metrics Backfill Complete\n"]
+    output.append(f"Backfilled metrics for {len(backfilled)} cycles:\n")
+
+    for bf in backfilled:
+        output.append(f"**Cycle {bf['cycle_id']}:**")
+        for name, value in bf["metrics"].items():
+            output.append(f"  - {name}: {value}")
+        output.append(f"  - Tags: {bf['tags']}")
+        output.append("")
+
+    return "\n".join(output)
+
+
+def get_research_health_check(
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Perform a health check on the research system.
+
+    Checks for:
+    - Memory consistency
+    - Missing metrics
+    - Experiment versioning coverage
+    - Hypothesis diversity
+
+    Returns:
+        Health report with recommendations
+    """
+    memory = memory_manager.memory
+    output = ["## Research System Health Check\n"]
+
+    # Memory stats
+    total_cycles = len(memory.history)
+    supported = sum(1 for c in memory.history if c.get("verdict") == "SUPPORTED")
+    refuted = sum(1 for c in memory.history if c.get("verdict") == "REFUTED")
+    other = total_cycles - supported - refuted
+
+    output.append("### Memory Status")
+    output.append(f"- Total cycles: {total_cycles}")
+    output.append(f"- Supported: {supported} ({supported/total_cycles*100:.0f}% if total_cycles else 0)")
+    output.append(f"- Refuted: {refuted}")
+    output.append(f"- Other: {other}")
+    output.append(f"- Insights: {len(memory.insights)}")
+    output.append(f"- Failures: {len(memory.failures)}")
+
+    # Experiment versioning coverage
+    output.append("\n### Experiment Versioning")
+    exp_count = experiment_manager.experiment_count
+    output.append(f"- Versioned experiments: {exp_count}")
+    coverage = exp_count / total_cycles * 100 if total_cycles else 0
+    output.append(f"- Coverage: {coverage:.0f}%")
+    if coverage < 50:
+        output.append("  [!] Low coverage - consider versioning past experiments")
+
+    # Metrics coverage
+    output.append("\n### Metrics Tracking")
+    metric_cycles = len(set(m.cycle_id for m in metrics_tracker._metrics))
+    output.append(f"- Cycles with metrics: {metric_cycles}")
+    output.append(f"- Total metric points: {metrics_tracker.metric_count}")
+    metrics_coverage = metric_cycles / total_cycles * 100 if total_cycles else 0
+    output.append(f"- Coverage: {metrics_coverage:.0f}%")
+    if metrics_coverage < 50:
+        output.append("  [Tip] Run backfill_metrics_from_memory to extract metrics from past analyses")
+
+    # Hypothesis diversity
+    output.append("\n### Hypothesis Diversity")
+    high_similarity_pairs = 0
+    if total_cycles >= 2:
+        for i in range(len(memory.history)):
+            for j in range(i + 1, len(memory.history)):
+                h1 = memory.history[i].get("hypothesis", "")
+                h2 = memory.history[j].get("hypothesis", "")
+                if similarity_checker.compute_similarity(h1, h2) >= 0.6:
+                    high_similarity_pairs += 1
+
+    output.append(f"- High similarity pairs (>=60%): {high_similarity_pairs}")
+    if high_similarity_pairs > total_cycles / 2:
+        output.append("  [!] Consider exploring more diverse hypotheses")
+    else:
+        output.append("  [OK] Good hypothesis diversity")
+
+    return "\n".join(output)
+
+
+# Create utility FunctionTool wrappers
+backfill_metrics_tool = FunctionTool(func=backfill_metrics_from_memory)
+health_check_tool = FunctionTool(func=get_research_health_check)
+
+
+# ============================================================================
 # AGENT DEFINITIONS
 # ============================================================================
 
@@ -1743,19 +2191,24 @@ theorist = Agent(
 YOUR TASK:
 Generate ONE falsifiable hypothesis about catastrophic forgetting in neural networks.
 
-FIRST: Use get_memory_context and get_all_cycles tools to review past research.
-- Check what hypotheses have already been tested
-- Avoid repeating failed approaches
-- Build on successful insights
+WORKFLOW:
+1. Use get_memory_context and get_all_cycles tools to review past research
+2. BEFORE finalizing, use check_hypothesis_novelty to verify your hypothesis is novel
+3. If the novelty check shows high similarity (>60%), revise your hypothesis
+
+IMPORTANT: The novelty checker will warn you if your hypothesis is too similar to past ones.
+Pay attention to these warnings - repeating similar hypotheses wastes research cycles.
 
 REQUIREMENTS:
 1. Must be FALSIFIABLE - specify exact condition that would refute it
 2. Must specify EXPECTED EFFECT SIZE vs baseline (e.g., "5% improvement")
 3. Must use a STANDARD BENCHMARK (PermutedMNIST, SplitMNIST, etc.)
 4. Must be NOVEL - do NOT repeat hypotheses from past cycles
+5. Must PASS the novelty check with <60% similarity to any past hypothesis
 
 OUTPUT FORMAT:
 HYPOTHESIS: [One sentence]
+NOVELTY CHECK: [Result from check_hypothesis_novelty tool]
 FALSIFICATION CONDITION: [What result would prove this wrong]
 EXPECTED EFFECT: [X% improvement/change vs baseline]
 BENCHMARK: [Which standard benchmark]
@@ -1763,7 +2216,7 @@ RATIONALE: [Why this might work, cite papers if relevant]
 
 Focus on REAL techniques: EWC, SAM, PackNet, memory replay, regularization.
 Do NOT propose vague "novel architectures" - be specific and runnable.""",
-    tools=[get_memory_tool, get_cycles_tool],
+    tools=[get_memory_tool, get_cycles_tool, check_novelty_tool],
     output_key="hypothesis"
 )
 
@@ -2243,6 +2696,13 @@ Metrics are automatically extracted and tracked across experiments.
 - "trends <metric>" - Show trends for a specific metric (accuracy, loss, forgetting)
 - "tag experiment <id> <tags>" - Add tags to an experiment for filtering
 - "find by tag <tag>" - Find experiments with a specific tag
+- "backfill metrics" - Extract metrics from past cycles that weren't tracked
+
+HYPOTHESIS NOVELTY & HEALTH:
+Prevent redundant research by checking hypothesis novelty.
+- "check novelty <hypothesis>" - Check if a hypothesis is similar to past ones
+- "similarity matrix" - Show similarity relationships between all past hypotheses
+- "health check" - Run a health check on the research system
 
 MEMORY SYSTEM:
 All research cycles are automatically saved to disk. Use the memory tools to:
@@ -2271,6 +2731,10 @@ BROWSER RESEARCH:
         get_trends_tool,
         get_by_tag_tool,
         progress_dashboard_tool,
+        check_novelty_tool,
+        similarity_matrix_tool,
+        backfill_metrics_tool,
+        health_check_tool,
     ]
 )
 
