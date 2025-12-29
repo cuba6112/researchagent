@@ -12,11 +12,11 @@ This is a Google ADK (Agent Development Kit) project implementing "Forgetting La
 # Install dependencies
 uv sync
 
-# Run the agent via ADK CLI
-adk run ika_agent
+# Run the agent via ADK CLI (from project root)
+uv run adk run ika_agent
 
-# Run with web interface
-adk web ika_agent
+# Run with web interface (use "." not "ika_agent")
+uv run adk web .
 
 # Install Playwright browsers (required for computer use)
 playwright install chromium
