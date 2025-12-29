@@ -33,6 +33,7 @@ agent1/
 │   └── .env                     # API keys (GEMINI_API_KEY)
 ├── outputs/                      # Persistent storage (outside agent package)
 │   ├── memory.json              # Research history, insights, failures
+│   ├── metrics.json             # Metrics tracking for trend analysis
 │   ├── reports/                 # Generated papers and summaries
 │   └── experiments/             # Versioned experiment snapshots
 │       ├── index.json           # Experiment index for quick lookup
@@ -102,6 +103,23 @@ Commands available through root agent:
 - `rerun experiment <id>` - Get command to re-run
 
 The Memory Saver agent automatically saves experiment versions after each successful cycle.
+
+### Metrics Tracking System
+
+The `MetricsTracker` singleton tracks experiment metrics over time for trend analysis:
+
+- **Automatic extraction** - Parses accuracy, loss, forgetting, delta, baseline from experiment output
+- **Tagging** - Tag experiments with method categories (ewc, replay, sam, etc.)
+- **Trend analysis** - Track metrics over cycles, compute statistics
+- **Progress dashboard** - Summary of research progress with trends
+
+Commands available through root agent:
+- `dashboard` / `progress` - Show research progress dashboard
+- `trends <metric>` - Show trends for accuracy, loss, forgetting, etc.
+- `tag experiment <id> <tags>` - Add tags to an experiment
+- `find by tag <tag>` - Find experiments with a specific tag
+
+Metrics are automatically recorded by the Memory Saver agent after each experiment.
 
 ### Computer Use (`ika_agent/playwright_computer.py`)
 

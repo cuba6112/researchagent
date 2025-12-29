@@ -124,10 +124,30 @@ class ExperimentConfig:
     )
 
 
+@dataclass(frozen=True)
+class MetricsConfig:
+    """Configuration for metrics tracking."""
+    # Metric extraction patterns
+    accuracy_patterns: Tuple[str, ...] = (
+        r"accuracy[:\s]+(\d+\.?\d*)%?",
+        r"acc[:\s]+(\d+\.?\d*)%?",
+        r"RESULT[:\s]+(\d+\.?\d*)%?",
+    )
+    loss_patterns: Tuple[str, ...] = (
+        r"loss[:\s]+(\d+\.?\d*)",
+        r"avg_loss[:\s]+(\d+\.?\d*)",
+    )
+    forgetting_patterns: Tuple[str, ...] = (
+        r"forgetting[:\s]+(\d+\.?\d*)%?",
+        r"backward_transfer[:\s]+([-\d.]+)%?",
+    )
+
+
 # Default configuration instances
 MEMORY_CONFIG = MemoryConfig()
 AGENT_CONFIG = AgentConfig()
 EXPERIMENT_CONFIG = ExperimentConfig()
+METRICS_CONFIG = MetricsConfig()
 
 
 # ============================================================================
@@ -853,6 +873,275 @@ experiment_manager = ExperimentVersionManager.get()
 
 
 # ============================================================================
+# METRICS TRACKING SYSTEM
+# ============================================================================
+
+@dataclass
+class MetricPoint:
+    """A single metric measurement from an experiment."""
+    cycle_id: int
+    experiment_id: str
+    timestamp: str
+    metric_name: str
+    value: float
+    tags: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cycle_id": self.cycle_id,
+            "experiment_id": self.experiment_id,
+            "timestamp": self.timestamp,
+            "metric_name": self.metric_name,
+            "value": self.value,
+            "tags": self.tags,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MetricPoint":
+        return cls(**data)
+
+
+class MetricsTracker:
+    """
+    Tracks metrics across experiments for trend analysis and visualization.
+
+    Stores metrics in a time-series format for easy querying and plotting.
+    """
+    _instance: Optional["MetricsTracker"] = None
+    _init_lock = threading.Lock()
+
+    def __init__(self, metrics_path: Path):
+        self._metrics_path = metrics_path
+        self._metrics: List[MetricPoint] = []
+        self._tags_index: Dict[str, List[str]] = {}  # experiment_id -> tags
+        self._load()
+
+    @classmethod
+    def get(cls, metrics_path: Optional[Path] = None) -> "MetricsTracker":
+        """Get the singleton MetricsTracker instance."""
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    path = metrics_path or (OUTPUT_DIR / "metrics.json")
+                    cls._instance = cls(path)
+                    logger.info(f"MetricsTracker created: {path}")
+        return cls._instance
+
+    def _load(self) -> None:
+        """Load metrics from disk."""
+        if self._metrics_path.exists():
+            with open(self._metrics_path, 'r') as f:
+                data = json.load(f)
+                self._metrics = [MetricPoint.from_dict(m) for m in data.get("metrics", [])]
+                self._tags_index = data.get("tags_index", {})
+            logger.debug(f"Loaded {len(self._metrics)} metric points")
+
+    def _save(self) -> None:
+        """Save metrics to disk."""
+        data = {
+            "metrics": [m.to_dict() for m in self._metrics],
+            "tags_index": self._tags_index,
+        }
+        with open(self._metrics_path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def extract_metrics(self, experiment_output: str) -> Dict[str, float]:
+        """Extract metrics from experiment output using patterns."""
+        config = METRICS_CONFIG
+        metrics = {}
+
+        # Extract accuracy
+        for pattern in config.accuracy_patterns:
+            matches = re.findall(pattern, experiment_output, re.IGNORECASE)
+            if matches:
+                try:
+                    metrics["accuracy"] = float(matches[-1])  # Use last match
+                    break
+                except ValueError:
+                    pass
+
+        # Extract loss
+        for pattern in config.loss_patterns:
+            matches = re.findall(pattern, experiment_output, re.IGNORECASE)
+            if matches:
+                try:
+                    metrics["loss"] = float(matches[-1])
+                    break
+                except ValueError:
+                    pass
+
+        # Extract forgetting
+        for pattern in config.forgetting_patterns:
+            matches = re.findall(pattern, experiment_output, re.IGNORECASE)
+            if matches:
+                try:
+                    metrics["forgetting"] = float(matches[-1])
+                    break
+                except ValueError:
+                    pass
+
+        # Look for DELTA values (common in experiment outputs)
+        delta_pattern = r"DELTA[:\s]+([-\d.]+)%?"
+        matches = re.findall(delta_pattern, experiment_output, re.IGNORECASE)
+        if matches:
+            try:
+                metrics["delta"] = float(matches[-1])
+            except ValueError:
+                pass
+
+        # Look for BASELINE values
+        baseline_pattern = r"BASELINE[:\s]+(\d+\.?\d*)%?"
+        matches = re.findall(baseline_pattern, experiment_output, re.IGNORECASE)
+        if matches:
+            try:
+                metrics["baseline"] = float(matches[-1])
+            except ValueError:
+                pass
+
+        return metrics
+
+    def record_metrics(
+        self,
+        cycle_id: int,
+        experiment_id: str,
+        metrics: Dict[str, float],
+        tags: Optional[List[str]] = None
+    ) -> None:
+        """Record metrics for an experiment."""
+        timestamp = datetime.now().isoformat()
+        tags = tags or []
+
+        for metric_name, value in metrics.items():
+            point = MetricPoint(
+                cycle_id=cycle_id,
+                experiment_id=experiment_id,
+                timestamp=timestamp,
+                metric_name=metric_name,
+                value=value,
+                tags=tags,
+            )
+            self._metrics.append(point)
+
+        # Update tags index
+        if tags:
+            self._tags_index[experiment_id] = tags
+
+        self._save()
+        logger.info(f"Recorded {len(metrics)} metrics for experiment {experiment_id}")
+
+    def add_tags(self, experiment_id: str, tags: List[str]) -> None:
+        """Add tags to an experiment."""
+        existing = self._tags_index.get(experiment_id, [])
+        combined = list(set(existing + tags))
+        self._tags_index[experiment_id] = combined
+
+        # Update metric points
+        for m in self._metrics:
+            if m.experiment_id == experiment_id:
+                m.tags = combined
+
+        self._save()
+
+    def get_metric_series(
+        self,
+        metric_name: str,
+        tags: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Get time series of a metric, optionally filtered by tags."""
+        series = []
+        for m in self._metrics:
+            if m.metric_name != metric_name:
+                continue
+            if tags and not any(t in m.tags for t in tags):
+                continue
+            series.append({
+                "cycle_id": m.cycle_id,
+                "value": m.value,
+                "timestamp": m.timestamp,
+                "experiment_id": m.experiment_id,
+            })
+        return sorted(series, key=lambda x: x["cycle_id"])
+
+    def get_summary_stats(self, metric_name: str) -> Dict[str, float]:
+        """Get summary statistics for a metric."""
+        values = [m.value for m in self._metrics if m.metric_name == metric_name]
+        if not values:
+            return {}
+
+        import statistics
+        stats = {
+            "count": len(values),
+            "mean": statistics.mean(values),
+            "min": min(values),
+            "max": max(values),
+        }
+        if len(values) >= 2:
+            stats["std"] = statistics.stdev(values)
+        return stats
+
+    def get_experiments_by_tag(self, tag: str) -> List[str]:
+        """Get all experiment IDs with a specific tag."""
+        return [exp_id for exp_id, tags in self._tags_index.items() if tag in tags]
+
+    def generate_progress_report(self) -> str:
+        """Generate a research progress dashboard."""
+        report = ["## Research Progress Dashboard\n"]
+
+        # Overall stats
+        total_experiments = len(set(m.experiment_id for m in self._metrics))
+        total_cycles = len(set(m.cycle_id for m in self._metrics))
+        report.append(f"**Total Experiments:** {total_experiments}")
+        report.append(f"**Total Cycles:** {total_cycles}\n")
+
+        # Metrics summary
+        metric_names = set(m.metric_name for m in self._metrics)
+        if metric_names:
+            report.append("### Metric Summaries\n")
+            for metric in sorted(metric_names):
+                stats = self.get_summary_stats(metric)
+                if stats:
+                    report.append(f"**{metric.title()}:**")
+                    report.append(f"  - Mean: {stats['mean']:.2f}")
+                    report.append(f"  - Range: [{stats['min']:.2f}, {stats['max']:.2f}]")
+                    if 'std' in stats:
+                        report.append(f"  - Std: {stats['std']:.2f}")
+                    report.append("")
+
+        # Trend analysis (last 5 cycles)
+        if self._metrics:
+            report.append("### Recent Trends (Last 5 Cycles)\n")
+            recent_cycles = sorted(set(m.cycle_id for m in self._metrics))[-5:]
+            for metric in sorted(metric_names):
+                series = self.get_metric_series(metric)
+                recent = [s for s in series if s["cycle_id"] in recent_cycles]
+                if len(recent) >= 2:
+                    trend = recent[-1]["value"] - recent[0]["value"]
+                    direction = "↑" if trend > 0 else "↓" if trend < 0 else "→"
+                    report.append(f"- {metric.title()}: {direction} {abs(trend):.2f}")
+
+        # Tags distribution
+        if self._tags_index:
+            report.append("\n### Experiment Tags\n")
+            tag_counts: Dict[str, int] = {}
+            for tags in self._tags_index.values():
+                for tag in tags:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            for tag, count in sorted(tag_counts.items(), key=lambda x: -x[1]):
+                report.append(f"- `{tag}`: {count} experiments")
+
+        return "\n".join(report)
+
+    @property
+    def metric_count(self) -> int:
+        """Get total number of metric points."""
+        return len(self._metrics)
+
+
+# Create singleton instance
+metrics_tracker = MetricsTracker.get()
+
+
+# ============================================================================
 # FILE-WRITING TOOLS
 # ============================================================================
 
@@ -1272,6 +1561,171 @@ rerun_experiment_tool = FunctionTool(func=get_rerun_command)
 
 
 # ============================================================================
+# METRICS AND TAGGING TOOLS
+# ============================================================================
+
+def record_experiment_metrics(
+    experiment_id: str,
+    experiment_output: str,
+    tags: Optional[List[str]] = None,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Extract and record metrics from an experiment's output.
+
+    Automatically extracts accuracy, loss, forgetting, delta, and baseline metrics.
+
+    Args:
+        experiment_id: The experiment ID to record metrics for
+        experiment_output: Raw output containing metric values
+        tags: Optional list of tags (e.g., ["ewc", "replay", "permuted-mnist"])
+
+    Returns:
+        Summary of recorded metrics
+    """
+    # Get cycle ID from experiment
+    exp = experiment_manager.get_experiment(experiment_id)
+    if not exp:
+        return f"Experiment {experiment_id} not found"
+
+    cycle_id = exp.cycle_id
+
+    # Extract metrics
+    metrics = metrics_tracker.extract_metrics(experiment_output)
+    if not metrics:
+        return f"No metrics found in experiment output for {experiment_id}"
+
+    # Record metrics
+    metrics_tracker.record_metrics(
+        cycle_id=cycle_id,
+        experiment_id=experiment_id,
+        metrics=metrics,
+        tags=tags
+    )
+
+    return f"""Recorded metrics for {experiment_id}:
+{json.dumps(metrics, indent=2)}
+Tags: {tags or 'none'}"""
+
+
+def tag_experiment(
+    experiment_id: str,
+    tags: List[str],
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Add tags to an experiment for better organization and filtering.
+
+    Common tags: ewc, replay, regularization, sam, permuted-mnist, split-mnist
+
+    Args:
+        experiment_id: The experiment to tag
+        tags: List of tags to add
+
+    Returns:
+        Confirmation of tags added
+    """
+    # Verify experiment exists
+    exp = experiment_manager.get_experiment(experiment_id)
+    if not exp:
+        return f"Experiment {experiment_id} not found"
+
+    metrics_tracker.add_tags(experiment_id, tags)
+    return f"Added tags to {experiment_id}: {tags}"
+
+
+def get_metric_trends(
+    metric_name: str = "accuracy",
+    tags: Optional[List[str]] = None,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Get trend data for a specific metric over time.
+
+    Args:
+        metric_name: Name of metric (accuracy, loss, forgetting, delta, baseline)
+        tags: Optional filter by tags
+
+    Returns:
+        Time series data and statistics for the metric
+    """
+    series = metrics_tracker.get_metric_series(metric_name, tags)
+    stats = metrics_tracker.get_summary_stats(metric_name)
+
+    if not series:
+        return f"No data found for metric '{metric_name}'"
+
+    output = [f"## {metric_name.title()} Trends\n"]
+
+    if tags:
+        output.append(f"*Filtered by tags: {tags}*\n")
+
+    # Stats
+    if stats:
+        output.append("### Statistics")
+        output.append(f"- Count: {stats['count']}")
+        output.append(f"- Mean: {stats['mean']:.2f}")
+        output.append(f"- Range: [{stats['min']:.2f}, {stats['max']:.2f}]")
+        if 'std' in stats:
+            output.append(f"- Std Dev: {stats['std']:.2f}")
+        output.append("")
+
+    # Time series
+    output.append("### Time Series")
+    output.append("| Cycle | Value | Experiment |")
+    output.append("|-------|-------|------------|")
+    for point in series[-10:]:  # Last 10 points
+        output.append(f"| {point['cycle_id']} | {point['value']:.2f} | {point['experiment_id'][:15]}... |")
+
+    return "\n".join(output)
+
+
+def get_experiments_by_tag(
+    tag: str,
+    tool_context: ToolContext = None
+) -> str:
+    """
+    Find all experiments with a specific tag.
+
+    Args:
+        tag: Tag to search for
+
+    Returns:
+        List of matching experiment IDs
+    """
+    exp_ids = metrics_tracker.get_experiments_by_tag(tag)
+    if not exp_ids:
+        return f"No experiments found with tag '{tag}'"
+
+    output = [f"## Experiments tagged '{tag}'\n"]
+    for exp_id in exp_ids:
+        exp = experiment_manager.get_experiment(exp_id)
+        if exp:
+            output.append(f"- **{exp_id}** (Cycle {exp.cycle_id})")
+            output.append(f"  Hash: {exp.code_hash}")
+
+    return "\n".join(output)
+
+
+def get_progress_dashboard(tool_context: ToolContext = None) -> str:
+    """
+    Generate a research progress dashboard with summary statistics and trends.
+
+    Returns:
+        Comprehensive progress report with metrics, trends, and tags
+    """
+    return metrics_tracker.generate_progress_report()
+
+
+# Create metrics and tagging FunctionTool wrappers
+record_metrics_tool = FunctionTool(func=record_experiment_metrics)
+tag_experiment_tool = FunctionTool(func=tag_experiment)
+get_trends_tool = FunctionTool(func=get_metric_trends)
+get_by_tag_tool = FunctionTool(func=get_experiments_by_tag)
+progress_dashboard_tool = FunctionTool(func=get_progress_dashboard)
+
+
+# ============================================================================
 # AGENT DEFINITIONS
 # ============================================================================
 
@@ -1524,8 +1978,8 @@ SURPRISES: [Unexpected or notable surprises, or "None"]""",
 memory_saver = Agent(
     name="memory_saver",
     model=MODEL,
-    description="Saves research cycle results to persistent memory and experiment versions",
-    instruction="""You are the MEMORY SAVER - you persist research findings and experiment versions.
+    description="Saves research cycle results to persistent memory, experiment versions, and metrics",
+    instruction="""You are the MEMORY SAVER - you persist research findings, experiment versions, and metrics.
 
 After each research cycle, extract and save the key information.
 
@@ -1553,12 +2007,20 @@ YOUR TASKS:
      - hypothesis: the tested hypothesis
      - experiment_output: the full experiment_code field
    - This saves a reproducible snapshot with code, seeds, hyperparameters, and environment
+   - Note the experiment_id returned for step 3
 
-NOTE: If the gate decision was REJECT, skip the experiment version save.
+3. RECORD METRICS (if experiment was run):
+   - After saving experiment version, use record_experiment_metrics tool with:
+     - experiment_id: the ID from step 2
+     - experiment_output: the full experiment_code field
+     - tags: relevant method tags (e.g., ["ewc"], ["replay"], ["sam"])
+   - This tracks accuracy, loss, forgetting metrics over time
+
+NOTE: If the gate decision was REJECT, skip steps 2 and 3.
 Set verdict to "REJECTED" and extract key learning from the gate_decision reasoning.
 
 Be concise and accurate. Extract exact values, don't paraphrase.""",
-    tools=[save_cycle_tool, save_experiment_tool],
+    tools=[save_cycle_tool, save_experiment_tool, record_metrics_tool],
     output_key="memory_save_result"
 )
 
@@ -1758,7 +2220,7 @@ Each research cycle follows this pipeline:
 5. ANALYST - provides honest numerical analysis
 6. TEACHER - explains findings simply
 7. EDITOR - reviews for scientific rigor
-8. MEMORY SAVER - persists findings and experiment versions to disk
+8. MEMORY SAVER - persists findings, experiment versions, and metrics to disk
 
 COMMANDS:
 - "run cycle" - Execute one complete research cycle (auto-saves to memory)
@@ -1774,6 +2236,13 @@ hyperparameters, and environment info for full reproducibility.
 - "show experiment <id or cycle>" - Display experiment details including code and environment
 - "compare experiments <id1> <id2>" - Compare two experiments to see differences
 - "rerun experiment <id>" - Get command to re-run a past experiment
+
+METRICS & PROGRESS TRACKING:
+Metrics are automatically extracted and tracked across experiments.
+- "dashboard" or "progress" - Show research progress dashboard with trends
+- "trends <metric>" - Show trends for a specific metric (accuracy, loss, forgetting)
+- "tag experiment <id> <tags>" - Add tags to an experiment for filtering
+- "find by tag <tag>" - Find experiments with a specific tag
 
 MEMORY SYSTEM:
 All research cycles are automatically saved to disk. Use the memory tools to:
@@ -1798,8 +2267,13 @@ BROWSER RESEARCH:
         get_experiment_tool,
         compare_experiments_tool,
         rerun_experiment_tool,
+        tag_experiment_tool,
+        get_trends_tool,
+        get_by_tag_tool,
+        progress_dashboard_tool,
     ]
 )
 
 logger.info(f"Forgetting Lab initialized with {memory_manager.cycle_count} existing research cycles")
 logger.info(f"Experiment versions saved: {experiment_manager.experiment_count}")
+logger.info(f"Metrics tracked: {metrics_tracker.metric_count} data points")
