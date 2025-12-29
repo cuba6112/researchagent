@@ -7,11 +7,42 @@ Uses synchronous Playwright in a thread to avoid Windows asyncio subprocess issu
 
 import asyncio
 import atexit
+import logging
 import shutil
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass(frozen=True)
+class BrowserConfig:
+    """Configuration for browser automation behavior."""
+    # Default screen size
+    default_screen_size: Tuple[int, int] = (1280, 936)
+
+    # Timeout settings (in milliseconds)
+    navigation_timeout: int = 30000  # 30 seconds
+    action_timeout: int = 10000  # 10 seconds
+
+    # Scroll settings
+    scroll_amount: int = 500  # pixels per scroll action
+
+    # Wait times (in milliseconds)
+    click_settle_time: int = 500  # time to wait after click
+    hover_settle_time: int = 200  # time to wait after hover
+    type_settle_time: int = 500  # time to wait after typing with enter
+
+
+# Default configuration instance
+BROWSER_CONFIG = BrowserConfig()
 
 from google.adk.tools.computer_use.base_computer import (
     BaseComputer,
@@ -72,16 +103,26 @@ class PlaywrightComputer(BaseComputer):
 
     def __init__(
         self,
-        screen_size: Tuple[int, int] = (1280, 936),
+        screen_size: Optional[Tuple[int, int]] = None,
         start_url: str = "https://www.google.com",
         search_engine_url: str = "https://www.google.com/search?q=",
         user_data_dir: Optional[str] = None,
+        navigation_timeout: Optional[int] = None,
+        action_timeout: Optional[int] = None,
+        config: Optional[BrowserConfig] = None,
     ):
-        self._screen_size = screen_size
+        cfg = config or BROWSER_CONFIG
+        self._screen_size = screen_size or cfg.default_screen_size
         self._start_url = start_url
         self._search_engine_url = search_engine_url
         self._owns_user_data_dir = user_data_dir is None
         self._user_data_dir = user_data_dir or tempfile.mkdtemp()
+        self._navigation_timeout = navigation_timeout or cfg.navigation_timeout
+        self._action_timeout = action_timeout or cfg.action_timeout
+        self._config = cfg
+
+        logger.info(f"Initializing PlaywrightComputer with screen_size={self._screen_size}, "
+                   f"navigation_timeout={self._navigation_timeout}ms, action_timeout={self._action_timeout}ms")
 
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[BrowserContext] = None  # launch_persistent_context returns BrowserContext
@@ -103,21 +144,24 @@ class PlaywrightComputer(BaseComputer):
         if self._closed:
             return
         self._closed = True
+        logger.debug("Starting browser cleanup")
 
         with self._lock:
             try:
                 if self._browser:
                     self._browser.close()
                     self._browser = None
-            except Exception:
-                pass
+                    logger.debug("Browser context closed")
+            except Exception as e:
+                logger.debug(f"Browser cleanup error (non-fatal): {e}")
 
             try:
                 if self._playwright:
                     self._playwright.stop()
                     self._playwright = None
-            except Exception:
-                pass
+                    logger.debug("Playwright stopped")
+            except Exception as e:
+                logger.debug(f"Playwright cleanup error (non-fatal): {e}")
 
             self._page = None
 
@@ -125,16 +169,19 @@ class PlaywrightComputer(BaseComputer):
             if self._owns_user_data_dir and self._user_data_dir:
                 try:
                     shutil.rmtree(self._user_data_dir, ignore_errors=True)
-                except Exception:
-                    pass
+                    logger.debug(f"Temp directory removed: {self._user_data_dir}")
+                except Exception as e:
+                    logger.debug(f"Temp directory cleanup error (non-fatal): {e}")
 
     def _ensure_browser_sync(self):
         """Ensure browser is initialized (synchronous version)."""
         with self._lock:
             if self._playwright is None:
+                logger.info("Starting Playwright")
                 self._playwright = sync_playwright().start()
 
             if self._browser is None:
+                logger.info("Launching browser context")
                 self._browser = self._playwright.chromium.launch_persistent_context(
                     user_data_dir=self._user_data_dir,
                     headless=False,
@@ -147,12 +194,13 @@ class PlaywrightComputer(BaseComputer):
                     self._page = self._browser.pages[0]
                 else:
                     self._page = self._browser.new_page()
-                self._page.goto(self._start_url)
-                self._page.wait_for_load_state("domcontentloaded")
+                logger.info(f"Navigating to start URL: {self._start_url}")
+                self._page.goto(self._start_url, timeout=self._navigation_timeout)
+                self._page.wait_for_load_state("domcontentloaded", timeout=self._navigation_timeout)
 
     def _get_state_sync(self) -> ComputerState:
         """Get current state synchronously."""
-        screenshot_bytes = self._page.screenshot(type="png")
+        screenshot_bytes = self._page.screenshot(type="png", timeout=self._action_timeout)
         return ComputerState(
             screenshot=screenshot_bytes,
             url=self._page.url,
@@ -188,8 +236,9 @@ class PlaywrightComputer(BaseComputer):
         """Navigate to a URL."""
         def _navigate(url):
             self._ensure_browser_sync()
-            self._page.goto(url)
-            self._page.wait_for_load_state("domcontentloaded")
+            logger.debug(f"Navigating to: {url}")
+            self._page.goto(url, timeout=self._navigation_timeout)
+            self._page.wait_for_load_state("domcontentloaded", timeout=self._navigation_timeout)
             return self._get_state_sync()
         return await self._run_in_thread(_navigate, url)
 
@@ -197,8 +246,9 @@ class PlaywrightComputer(BaseComputer):
         """Go back in browser history."""
         def _go_back():
             self._ensure_browser_sync()
-            self._page.go_back()
-            self._page.wait_for_load_state("domcontentloaded")
+            logger.debug("Going back in history")
+            self._page.go_back(timeout=self._navigation_timeout)
+            self._page.wait_for_load_state("domcontentloaded", timeout=self._navigation_timeout)
             return self._get_state_sync()
         return await self._run_in_thread(_go_back)
 
@@ -206,8 +256,9 @@ class PlaywrightComputer(BaseComputer):
         """Go forward in browser history."""
         def _go_forward():
             self._ensure_browser_sync()
-            self._page.go_forward()
-            self._page.wait_for_load_state("domcontentloaded")
+            logger.debug("Going forward in history")
+            self._page.go_forward(timeout=self._navigation_timeout)
+            self._page.wait_for_load_state("domcontentloaded", timeout=self._navigation_timeout)
             return self._get_state_sync()
         return await self._run_in_thread(_go_forward)
 
@@ -217,8 +268,9 @@ class PlaywrightComputer(BaseComputer):
             self._ensure_browser_sync()
             # Navigate to search engine home (without query)
             base_url = self._search_engine_url.split("?")[0].removesuffix("/search")
-            self._page.goto(base_url or "https://www.google.com")
-            self._page.wait_for_load_state("domcontentloaded")
+            logger.debug(f"Navigating to search engine: {base_url}")
+            self._page.goto(base_url or "https://www.google.com", timeout=self._navigation_timeout)
+            self._page.wait_for_load_state("domcontentloaded", timeout=self._navigation_timeout)
             return self._get_state_sync()
         return await self._run_in_thread(_search)
 
@@ -227,7 +279,7 @@ class PlaywrightComputer(BaseComputer):
         def _click(x, y):
             self._ensure_browser_sync()
             self._page.mouse.click(x, y)
-            self._page.wait_for_timeout(500)  # Allow navigation/actions to complete
+            self._page.wait_for_timeout(self._config.click_settle_time)
             return self._get_state_sync()
         return await self._run_in_thread(_click, x, y)
 
@@ -236,7 +288,7 @@ class PlaywrightComputer(BaseComputer):
         def _hover(x, y):
             self._ensure_browser_sync()
             self._page.mouse.move(x, y)
-            self._page.wait_for_timeout(200)
+            self._page.wait_for_timeout(self._config.hover_settle_time)
             return self._get_state_sync()
         return await self._run_in_thread(_hover, x, y)
 
@@ -274,7 +326,7 @@ class PlaywrightComputer(BaseComputer):
 
             if press_enter:
                 self._page.keyboard.press("Enter")
-                self._page.wait_for_timeout(500)
+                self._page.wait_for_timeout(self._config.type_settle_time)
 
             return self._get_state_sync()
         return await self._run_in_thread(_type, x, y, text, press_enter, clear_before_typing)
@@ -285,16 +337,16 @@ class PlaywrightComputer(BaseComputer):
         """Scroll the document."""
         def _scroll(direction):
             self._ensure_browser_sync()
-            scroll_amount = 500
+            amount = self._config.scroll_amount
 
             if direction == "up":
-                self._page.evaluate(f"window.scrollBy(0, -{scroll_amount})")
+                self._page.evaluate(f"window.scrollBy(0, -{amount})")
             elif direction == "down":
-                self._page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+                self._page.evaluate(f"window.scrollBy(0, {amount})")
             elif direction == "left":
-                self._page.evaluate(f"window.scrollBy(-{scroll_amount}, 0)")
+                self._page.evaluate(f"window.scrollBy(-{amount}, 0)")
             elif direction == "right":
-                self._page.evaluate(f"window.scrollBy({scroll_amount}, 0)")
+                self._page.evaluate(f"window.scrollBy({amount}, 0)")
 
             return self._get_state_sync()
         return await self._run_in_thread(_scroll, direction)

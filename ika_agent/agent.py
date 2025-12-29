@@ -5,26 +5,38 @@ An autonomous AI scientist that runs iterative research cycles
 on catastrophic forgetting in neural networks.
 """
 
+import logging
+
 from google.adk import Agent
 from google.adk.agents import SequentialAgent
 from google.adk.tools import google_search, FunctionTool, ToolContext, transfer_to_agent
-from google.adk.code_executors import BuiltInCodeExecutor
+from google.adk.code_executors import UnsafeLocalCodeExecutor
 import threading
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 # Computer use imports (optional - requires playwright)
 try:
     from google.adk.tools.computer_use.computer_use_toolset import ComputerUseToolset
     from .playwright_computer import PlaywrightComputer
     COMPUTER_USE_AVAILABLE = True
+    logger.info("Computer use (Playwright) is available")
 except ImportError:
     COMPUTER_USE_AVAILABLE = False
     ComputerUseToolset = None
     PlaywrightComputer = None
+    logger.info("Computer use (Playwright) is not available - install playwright to enable")
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
 from pathlib import Path
 import json
 import os
+import time
 
 # ============================================================================
 # OUTPUT DIRECTORY
@@ -37,108 +49,320 @@ REPORTS_DIR = OUTPUT_DIR / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    """Configuration for memory system behavior."""
+    # Context display limits
+    recent_insights_limit: int = 5
+    recent_failures_limit: int = 5
+    recent_surprises_limit: int = 5
+    recent_cycles_limit: int = 3
+
+    # Compaction settings
+    keep_full_cycles: int = 3
+    max_insights: int = 20
+    max_failures: int = 10
+    max_surprises: int = 20
+
+    # Truncation lengths
+    hypothesis_preview_length: int = 100
+    hypothesis_compact_length: int = 200
+    summary_compact_length: int = 300
+
+    # File locking
+    lock_timeout_seconds: float = 30.0
+    stale_lock_age_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """Configuration for agent behavior."""
+    # Model settings
+    default_model: str = "gemini-3-flash-preview"
+    computer_use_model: str = "gemini-2.5-computer-use-preview-10-2025"
+
+    # Browser settings
+    browser_screen_size: tuple = (1280, 936)
+
+
+# Default configuration instances
+MEMORY_CONFIG = MemoryConfig()
+AGENT_CONFIG = AgentConfig()
+
+
+# ============================================================================
 # MEMORY SYSTEM
 # ============================================================================
 
 @dataclass
 class Memory:
     """Persistent memory across research cycles."""
-    history: List[Dict] = field(default_factory=list)
+    history: List[Dict[str, Any]] = field(default_factory=list)
     insights: List[str] = field(default_factory=list)
     failures: List[str] = field(default_factory=list)
     surprises: List[str] = field(default_factory=list)
-    knowledge_base: Dict = field(default_factory=dict)
+    knowledge_base: Dict[str, Any] = field(default_factory=dict)
 
-    def add_cycle(self, cycle_id: int, result: Dict):
+    def add_cycle(self, cycle_id: int, result: Dict[str, Any]) -> None:
         self.history.append({
             "cycle_id": cycle_id,
             "timestamp": datetime.now().isoformat(),
             **result
         })
 
-    def add_insight(self, insight: str):
+    def add_insight(self, insight: str) -> None:
         self.insights.append(insight)
 
-    def add_failure(self, failure: str):
+    def add_failure(self, failure: str) -> None:
         self.failures.append(failure)
 
-    def add_surprise(self, surprise: str):
+    def add_surprise(self, surprise: str) -> None:
         self.surprises.append(surprise)
 
-    def get_context(self) -> str:
+    def get_context(self, config: Optional[MemoryConfig] = None) -> str:
         """Build context string for agents."""
+        cfg = config or MEMORY_CONFIG
         context = []
         if self.insights:
-            context.append("KEY INSIGHTS:\n" + "\n".join(f"- {i}" for i in self.insights[-5:]))
+            recent_insights = self.insights[-cfg.recent_insights_limit:]
+            context.append("KEY INSIGHTS:\n" + "\n".join(f"- {i}" for i in recent_insights))
         if self.failures:
-            context.append("KNOWN FAILURES:\n" + "\n".join(f"- {f}" for f in self.failures[-5:]))
+            recent_failures = self.failures[-cfg.recent_failures_limit:]
+            context.append("KNOWN FAILURES:\n" + "\n".join(f"- {f}" for f in recent_failures))
         if self.surprises:
-            context.append("SURPRISE FINDINGS:\n" + "\n".join(f"- {s}" for s in self.surprises[-5:]))
+            recent_surprises = self.surprises[-cfg.recent_surprises_limit:]
+            context.append("SURPRISE FINDINGS:\n" + "\n".join(f"- {s}" for s in recent_surprises))
         if self.history:
-            recent = self.history[-3:]
+            recent = self.history[-cfg.recent_cycles_limit:]
             cycle_summaries = []
             for h in recent:
                 # Safe slicing: handle None values
                 hypothesis = h.get('hypothesis') or 'N/A'
-                cycle_summaries.append(f"- Cycle {h['cycle_id']}: {hypothesis[:100]}...")
+                preview = hypothesis[:cfg.hypothesis_preview_length]
+                cycle_summaries.append(f"- Cycle {h['cycle_id']}: {preview}...")
             context.append("RECENT CYCLES:\n" + "\n".join(cycle_summaries))
         return "\n\n".join(context) if context else "No prior context."
 
-    def compact(self, keep_full_cycles: int = 3, max_insights: int = 20, max_failures: int = 10):
+    def compact(self, config: Optional[MemoryConfig] = None) -> "Memory":
         """Compact memory to reduce token usage. Keeps recent cycles in full, summarizes older ones."""
+        cfg = config or MEMORY_CONFIG
+
         # Compact history: keep only summary for old cycles
-        if len(self.history) > keep_full_cycles:
-            old_cycles = self.history[:-keep_full_cycles]
-            recent_cycles = self.history[-keep_full_cycles:]
+        if len(self.history) > cfg.keep_full_cycles:
+            old_cycles = self.history[:-cfg.keep_full_cycles]
+            recent_cycles = self.history[-cfg.keep_full_cycles:]
 
             # Summarize old cycles to minimal format
-            compacted = []
+            compacted: List[Dict[str, Any]] = []
             for h in old_cycles:
+                hypothesis = (h.get("hypothesis") or "")[:cfg.hypothesis_compact_length]
+                summary = (h.get("key_learning") or h.get("analysis") or "")[:cfg.summary_compact_length]
                 compacted.append({
                     "cycle_id": h.get("cycle_id"),
                     "timestamp": h.get("timestamp"),
-                    "hypothesis": (h.get("hypothesis") or "")[:200],  # Truncate
+                    "hypothesis": hypothesis,
                     "verdict": h.get("verdict", "unknown"),
-                    "summary": (h.get("key_learning") or h.get("analysis") or "")[:300]
+                    "summary": summary
                 })
             self.history = compacted + recent_cycles
 
         # Keep only recent insights/failures, deduplicate
-        self.insights = list(dict.fromkeys(self.insights[-max_insights:]))
-        self.failures = list(dict.fromkeys(self.failures[-max_failures:]))
-        self.surprises = list(dict.fromkeys(self.surprises[-max_insights:]))
+        self.insights = list(dict.fromkeys(self.insights[-cfg.max_insights:]))
+        self.failures = list(dict.fromkeys(self.failures[-cfg.max_failures:]))
+        self.surprises = list(dict.fromkeys(self.surprises[-cfg.max_surprises:]))
 
         return self
 
-    def save(self, path: str):
-        # Auto-compact before saving
-        self.compact()
-        with open(path, 'w') as f:
-            json.dump({
-                "history": self.history,
-                "insights": self.insights,
-                "failures": self.failures,
-                "surprises": self.surprises,
-                "knowledge_base": self.knowledge_base
-            }, f, indent=2)
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert memory to dictionary for serialization."""
+        return {
+            "history": self.history,
+            "insights": self.insights,
+            "failures": self.failures,
+            "surprises": self.surprises,
+            "knowledge_base": self.knowledge_base
+        }
 
     @classmethod
-    def load(cls, path: str) -> "Memory":
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                data = json.load(f)
-                data.setdefault("history", [])
-                data.setdefault("insights", [])
-                data.setdefault("failures", [])
-                data.setdefault("surprises", [])
-                data.setdefault("knowledge_base", {})
-                return cls(**data)
-        return cls()
+    def from_dict(cls, data: Dict[str, Any]) -> "Memory":
+        """Create Memory from dictionary."""
+        data.setdefault("history", [])
+        data.setdefault("insights", [])
+        data.setdefault("failures", [])
+        data.setdefault("surprises", [])
+        data.setdefault("knowledge_base", {})
+        return cls(**data)
 
 
-# Global memory instance - loaded from disk
-memory = Memory.load(str(MEMORY_FILE))
-memory_lock = threading.Lock()
+class MemoryManager:
+    """
+    Singleton manager for persistent memory with file-level locking.
+
+    Provides thread-safe and process-safe access to the memory file.
+    Use MemoryManager.get() to access the singleton instance.
+    """
+    _instance: Optional["MemoryManager"] = None
+    _init_lock = threading.Lock()
+
+    def __init__(self, memory_path: Path):
+        """Initialize the memory manager. Use MemoryManager.get() instead."""
+        self._memory_path = memory_path
+        self._lock_path = memory_path.with_suffix(".lock")
+        self._thread_lock = threading.Lock()
+        self._memory: Optional[Memory] = None
+        logger.debug(f"MemoryManager initialized with path: {memory_path}")
+
+    @classmethod
+    def get(cls, memory_path: Optional[Path] = None) -> "MemoryManager":
+        """Get the singleton MemoryManager instance."""
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    path = memory_path or MEMORY_FILE
+                    cls._instance = cls(path)
+                    logger.info(f"MemoryManager singleton created for: {path}")
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        """Reset the singleton (primarily for testing)."""
+        with cls._init_lock:
+            cls._instance = None
+            logger.debug("MemoryManager singleton reset")
+
+    def _acquire_file_lock(self, timeout: Optional[float] = None) -> bool:
+        """
+        Acquire a file-level lock for cross-process safety.
+        Uses a .lock file with atomic creation.
+        """
+        timeout = timeout if timeout is not None else MEMORY_CONFIG.lock_timeout_seconds
+        stale_age = MEMORY_CONFIG.stale_lock_age_seconds
+        start_time = time.time()
+
+        while True:
+            try:
+                # Try to create lock file exclusively
+                fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                logger.debug(f"File lock acquired: {self._lock_path}")
+                return True
+            except FileExistsError:
+                # Lock file exists, check if stale
+                try:
+                    lock_age = time.time() - os.path.getmtime(self._lock_path)
+                    if lock_age > stale_age:
+                        logger.warning(f"Removing stale lock file (age: {lock_age:.1f}s)")
+                        os.remove(self._lock_path)
+                        continue
+                except OSError:
+                    pass  # Lock file was removed by another process
+
+                if time.time() - start_time > timeout:
+                    logger.error(f"Timeout waiting for file lock after {timeout}s")
+                    return False
+
+                time.sleep(0.1)  # Wait and retry
+
+    def _release_file_lock(self) -> None:
+        """Release the file-level lock."""
+        try:
+            os.remove(self._lock_path)
+            logger.debug(f"File lock released: {self._lock_path}")
+        except OSError as e:
+            logger.warning(f"Error releasing file lock: {e}")
+
+    def load(self) -> Memory:
+        """Load memory from disk with file locking."""
+        with self._thread_lock:
+            if not self._acquire_file_lock():
+                raise RuntimeError("Could not acquire memory file lock")
+            try:
+                if os.path.exists(self._memory_path):
+                    with open(self._memory_path, 'r') as f:
+                        data = json.load(f)
+                        self._memory = Memory.from_dict(data)
+                        logger.info(f"Memory loaded (cycles={len(self._memory.history)}, insights={len(self._memory.insights)})")
+                else:
+                    self._memory = Memory()
+                    logger.info("No existing memory, starting fresh")
+                return self._memory
+            finally:
+                self._release_file_lock()
+
+    def save(self, memory: Optional[Memory] = None, auto_compact: bool = True) -> None:
+        """Save memory to disk with file locking."""
+        with self._thread_lock:
+            mem = memory or self._memory
+            if mem is None:
+                raise ValueError("No memory to save")
+
+            if auto_compact:
+                mem.compact()
+
+            if not self._acquire_file_lock():
+                raise RuntimeError("Could not acquire memory file lock")
+            try:
+                with open(self._memory_path, 'w') as f:
+                    json.dump(mem.to_dict(), f, indent=2)
+                self._memory = mem
+                logger.info(f"Memory saved (cycles={len(mem.history)}, insights={len(mem.insights)})")
+            finally:
+                self._release_file_lock()
+
+    def with_memory(self, func):
+        """
+        Context manager decorator for atomic memory operations.
+
+        Usage:
+            @memory_manager.with_memory
+            def my_operation(memory: Memory) -> str:
+                memory.add_insight("New insight")
+                return "done"
+        """
+        def wrapper(*args, **kwargs):
+            with self._thread_lock:
+                if not self._acquire_file_lock():
+                    raise RuntimeError("Could not acquire memory file lock")
+                try:
+                    # Load latest
+                    if os.path.exists(self._memory_path):
+                        with open(self._memory_path, 'r') as f:
+                            self._memory = Memory.from_dict(json.load(f))
+                    else:
+                        self._memory = Memory()
+
+                    # Execute function
+                    result = func(self._memory, *args, **kwargs)
+
+                    # Save changes
+                    self._memory.compact()
+                    with open(self._memory_path, 'w') as f:
+                        json.dump(self._memory.to_dict(), f, indent=2)
+
+                    return result
+                finally:
+                    self._release_file_lock()
+        return wrapper
+
+    @property
+    def memory(self) -> Memory:
+        """Get the current memory, loading if necessary."""
+        if self._memory is None:
+            self.load()
+        return self._memory
+
+    @property
+    def cycle_count(self) -> int:
+        """Get the number of research cycles."""
+        return len(self.memory.history)
+
+
+# Create singleton instance
+memory_manager = MemoryManager.get()
 
 
 # ============================================================================
@@ -169,40 +393,43 @@ def save_cycle_to_memory(
     Returns:
         Confirmation message with cycle ID
     """
-    global memory
+    logger.debug(f"Saving cycle to memory (verdict={verdict})")
 
-    with memory_lock:
-        # Reload from disk to get latest state (avoid race conditions)
-        memory = Memory.load(str(MEMORY_FILE))
+    # Use memory manager for atomic load-modify-save
+    memory = memory_manager.load()
 
-        cycle_id = len(memory.history) + 1
+    cycle_id = len(memory.history) + 1
+    logger.info(f"Creating research cycle {cycle_id} with verdict: {verdict}")
 
-        result = {
-            "hypothesis": hypothesis,
-            "critique": critique,
-            "gate_decision": gate_decision,
-            "analysis": analysis,
-            "verdict": verdict,
-            "key_learning": key_learning,
-            "surprise": surprise
-        }
+    result = {
+        "hypothesis": hypothesis,
+        "critique": critique,
+        "gate_decision": gate_decision,
+        "analysis": analysis,
+        "verdict": verdict,
+        "key_learning": key_learning,
+        "surprise": surprise
+    }
 
-        memory.add_cycle(cycle_id, result)
+    memory.add_cycle(cycle_id, result)
 
-        # Add to insights or failures based on verdict
-        verdict_upper = verdict.upper()
-        if verdict_upper == "SUPPORTED":
-            memory.add_insight(key_learning)
-        elif verdict_upper == "REFUTED":
-            memory.add_failure(f"Cycle {cycle_id}: {key_learning}")
-        # INCONCLUSIVE: neither insight nor failure - valuable data but not conclusive
-        if surprise:
-            cleaned = surprise.strip()
-            if cleaned and cleaned.lower() not in {"none", "n/a", "na", "no", "null"}:
-                memory.add_surprise(cleaned)
+    # Add to insights or failures based on verdict
+    verdict_upper = verdict.upper()
+    if verdict_upper == "SUPPORTED":
+        memory.add_insight(key_learning)
+        logger.info(f"Cycle {cycle_id}: Added insight - {key_learning[:50]}...")
+    elif verdict_upper == "REFUTED":
+        memory.add_failure(f"Cycle {cycle_id}: {key_learning}")
+        logger.info(f"Cycle {cycle_id}: Recorded failure")
+    # INCONCLUSIVE: neither insight nor failure - valuable data but not conclusive
+    if surprise:
+        cleaned = surprise.strip()
+        if cleaned and cleaned.lower() not in {"none", "n/a", "na", "no", "null"}:
+            memory.add_surprise(cleaned)
+            logger.info(f"Cycle {cycle_id}: Recorded surprise finding")
 
-        # Persist to disk
-        memory.save(str(MEMORY_FILE))
+    # Persist to disk with file locking
+    memory_manager.save(memory)
 
     return f"Cycle {cycle_id} saved to memory. Total cycles: {len(memory.history)}"
 
@@ -247,7 +474,7 @@ def save_report(
     Returns:
         Path to the saved report
     """
-    global memory
+    logger.info(f"Generating {report_type} report: {title[:50]}...")
 
     # Create safe filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -257,10 +484,8 @@ def save_report(
     filename = f"{timestamp}_{report_type}_{safe_title}.md"
     filepath = REPORTS_DIR / filename
 
-    # Reload memory to get accurate cycle count
-    with memory_lock:
-        memory = Memory.load(str(MEMORY_FILE))
-        total_cycles = len(memory.history)
+    # Get accurate cycle count from memory manager
+    total_cycles = memory_manager.cycle_count
 
     # Add metadata header
     full_content = f"""---
@@ -276,6 +501,7 @@ total_cycles: {total_cycles}
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(full_content)
 
+    logger.info(f"Report saved to: {filepath} ({len(content)} chars)")
     return f"Report saved to: {filepath}"
 
 
@@ -286,11 +512,9 @@ def get_memory_context(tool_context: ToolContext = None) -> str:
     Returns:
         Formatted string with memory context for the agent
     """
-    global memory
-    with memory_lock:
-        # Reload from disk to get latest
-        memory = Memory.load(str(MEMORY_FILE))
-        return memory.get_context()
+    # Load latest from disk via memory manager
+    memory = memory_manager.load()
+    return memory.get_context()
 
 
 def get_all_cycles(tool_context: ToolContext = None) -> str:
@@ -300,25 +524,25 @@ def get_all_cycles(tool_context: ToolContext = None) -> str:
     Returns:
         JSON string with all cycle data
     """
-    global memory
-    with memory_lock:
-        memory = Memory.load(str(MEMORY_FILE))
+    # Load latest from disk via memory manager
+    memory = memory_manager.load()
 
-        if not memory.history:
-            return "No research cycles have been recorded yet."
+    if not memory.history:
+        return "No research cycles have been recorded yet."
 
-        output = []
-        for cycle in memory.history:
-            # Safe slicing: handle None values
-            hypothesis = cycle.get('hypothesis') or 'N/A'
-            output.append(f"""
+    output = []
+    for cycle in memory.history:
+        # Safe slicing: handle None values
+        hypothesis = cycle.get('hypothesis') or 'N/A'
+        hypothesis_preview = hypothesis[:MEMORY_CONFIG.hypothesis_compact_length]
+        output.append(f"""
 ## Cycle {cycle.get('cycle_id', 'N/A')} - {cycle.get('timestamp', 'N/A')}
-**Hypothesis:** {hypothesis[:200]}...
+**Hypothesis:** {hypothesis_preview}...
 **Verdict:** {cycle.get('verdict', 'N/A')}
 **Key Learning:** {cycle.get('key_learning', 'N/A')}
 """)
 
-        return "\n".join(output)
+    return "\n".join(output)
 
 
 # Create FunctionTool wrappers
@@ -333,8 +557,9 @@ get_cycles_tool = FunctionTool(func=get_all_cycles)
 # AGENT DEFINITIONS
 # ============================================================================
 
-MODEL = "gemini-3-flash-preview"
-COMPUTER_USE_MODEL = "gemini-2.5-computer-use-preview-10-2025"  # No Gemini 3 computer use model yet
+# Model configuration (from AGENT_CONFIG)
+MODEL = AGENT_CONFIG.default_model
+COMPUTER_USE_MODEL = AGENT_CONFIG.computer_use_model  # No Gemini 3 computer use model yet
 
 # Theorist: Generate falsifiable hypothesis
 theorist = Agent(
@@ -458,6 +683,9 @@ REQUIREMENTS:
 3. Must have CLEAR success/failure metrics defined BEFORE running
 4. Must include baseline comparison
 5. Must output numerical results
+6. Must run at least 3 random seeds (or explain why not)
+7. Must include at least one ablation that removes the key proposed component
+8. Must log the full experiment config (seed, dataset, model, hyperparams)
 
 OUTPUT FORMAT:
 ```python
@@ -473,10 +701,12 @@ import torch.nn as nn
 if __name__ == "__main__":
     # Run experiment
     # Print: RESULT: X% | BASELINE: Y% | DELTA: Z%
-```
+    # Print: SEEDS: [...] | MEAN: X | STD: Y
+    # Print: CONFIG: {...}
+``` 
 
 Code must be COMPLETE and RUNNABLE. No placeholders.""",
-    code_executor=BuiltInCodeExecutor(),
+    code_executor=UnsafeLocalCodeExecutor(),
     output_key="experiment_code"
 )
 
@@ -499,6 +729,8 @@ VS BASELINE: [X% vs Y% = delta Z%]
 SIGNIFICANCE: [p-value if available, or "n=1, not significant"]
 VERDICT: [SUPPORTED / REFUTED / INCONCLUSIVE]
 SURPRISES: [Unexpected results or anomalies, or "None"]
+SEED COVERAGE: [n, mean, std or "single-run"]
+ABLATION CHECK: [Passed/Failed + brief note]
 
 HONEST ASSESSMENT: [2-3 sentences]
 NEXT STEPS: [Only if supported]
@@ -554,6 +786,9 @@ CHECK FOR:
 3. CITATION HALLUCINATION: Are papers real?
 4. METRIC THEATER: Right measurements?
 5. REPRODUCIBILITY: Can others replicate?
+6. SEED ROBUSTNESS: Were multiple seeds reported?
+7. ABLATIONS: Was a key-component ablation included?
+8. CONFIG LOGGING: Were full config details logged?
 
 OUTPUT FORMAT:
 RIGOR SCORE: [1-10]
@@ -752,7 +987,7 @@ OUTPUT FORMAT:
 | ... | ... | ... |
 
 Be thorough but efficient. Focus on actionable information.""",
-        tools=[ComputerUseToolset(computer=PlaywrightComputer(screen_size=(1280, 936)))],
+        tools=[ComputerUseToolset(computer=PlaywrightComputer(screen_size=AGENT_CONFIG.browser_screen_size))],
         output_key="web_research"
     )
 else:
@@ -824,3 +1059,5 @@ BROWSER RESEARCH:
     sub_agents=[research_cycle, reporter, synthesizer] + ([browser_researcher] if browser_researcher else []),
     tools=[get_memory_tool, get_cycles_tool]
 )
+
+logger.info(f"Forgetting Lab initialized with {memory_manager.cycle_count} existing research cycles")
